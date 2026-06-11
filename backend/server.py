@@ -305,7 +305,8 @@ DEFAULT_STRATEGY = {
     "ema_fast": 21, "ema_slow": 55, "rsi_period": 14,
     "atr_period": 14, "sl_atr": 1.5, "tp_atr": 2.5, "min_confidence": 0.4,
 }
-DEFAULT_SESSIONS = ["london", "new_york", "overlap"]
+# P1 fix (2026-06): Asia enabled by default (lots auto-halved via adaptive_lot session_mult)
+DEFAULT_SESSIONS = ["london", "new_york", "overlap", "asia"]
 PLAN_DAYS = {"monthly": 30, "quarterly": 90, "yearly": 365}
 
 
@@ -2036,6 +2037,7 @@ async def _scan_and_persist(bots: List[dict]) -> int:
     # ---- Global / per-user gates evaluated once per scan ----
     news_reason = _news_active()
     dd_cache: Dict[str, dict] = {}
+    equity_cache: Dict[str, float] = {}
     for bot in bots:
         try:
             user_id = bot["user_id"]
@@ -2064,15 +2066,26 @@ async def _scan_and_persist(bots: List[dict]) -> int:
                         "last_scan_result": f"max_positions_reached:{open_n}/{int(bot['max_positions'])}",
                     }})
                     continue
-            # 4) DAILY LOSS LIMIT per bot (realized + floating, USD, UTC day)
+            # 4) DAILY LOSS LIMIT per bot (realized + floating, UTC day).
+            # P0 fix (2026-06): the limit is a PERCENT of account equity (matches the
+            # frontend's "DAILY LOSS %" label), not flat USD. Flat-USD ($5) capped the
+            # account at ~1 loss/day. Falls back to flat-USD only when the bridge has
+            # never reported equity.
             if bot.get("daily_loss_limit") is not None:
                 limit = float(bot["daily_loss_limit"])
                 if limit > 0:
+                    if user_id not in equity_cache:
+                        _acct = await db.mt5_accounts.find_one(
+                            {"user_id": user_id}, sort=[("updated_at", -1)],
+                        )
+                        equity_cache[user_id] = float(_acct["equity"]) if _acct and _acct.get("equity") else 0.0
+                    _eq = equity_cache[user_id]
+                    limit_usd = _eq * (limit / 100.0) if _eq > 0 else limit
                     daily = await _bot_daily_pnl(bot["_id"])
-                    if daily <= -limit:
+                    if daily <= -limit_usd:
                         await db.bots.update_one({"_id": bot["_id"]}, {"$set": {
                             "last_scan_at": now_iso(),
-                            "last_scan_result": f"daily_loss_blocked:{daily:.2f}/-{limit:.2f}",
+                            "last_scan_result": f"daily_loss_blocked:{daily:.2f}/-{limit_usd:.2f}({limit:g}%)",
                         }})
                         continue
             cfg = StrategyConfig.from_dict(bot.get("strategy_config") or {})
@@ -2152,11 +2165,12 @@ async def _scan_and_persist(bots: List[dict]) -> int:
             # Stash the recent-sides list in a local for the post-generation gate.
             _recent_sides_same_pair: set = {s["side"] for s in recent_any_dir}
             # Route to strategy engine (v2 by default)
+            # P2 fix (2026-06): HTF trend fetched ONCE here and reused by gate #6 below
+            # (was fetched twice — dedupe).
             v2_ctx = None
+            htf_label = bot.get("higher_tf_confirmation") or "off"
+            htf_trend = await _htf_trend(bot["pair"], htf_label) if htf_label not in (None, "off") else None
             if STRATEGY_VERSION == "v2":
-                # Pre-fetch HTF trend if configured (engine v2 uses it as a confluence factor)
-                htf_label = bot.get("higher_tf_confirmation") or "off"
-                htf_trend = await _htf_trend(bot["pair"], htf_label) if htf_label not in (None, "off") else None
                 v2_out = generate_signal_v2(candles, STRATEGY_V2_CFG, htf_trend=htf_trend)
                 if v2_out:
                     sig, v2_ctx = v2_out
@@ -2237,15 +2251,18 @@ async def _scan_and_persist(bots: List[dict]) -> int:
                     "last_mode": _mode_badge,
                 }})
                 continue
-            # 6) HIGHER-TF CONFIRMATION — drop signals that contradict the higher timeframe trend
-            htf = bot.get("higher_tf_confirmation")
-            if htf and htf != "off":
-                trend = await _htf_trend(bot["pair"], htf)
-                want = "up" if sig.side == "buy" else "down"
-                if trend != want:
+            # 6) HIGHER-TF CONFIRMATION — block only when the higher-TF trend is
+            # DECISIVELY opposite the signal. P2 fix (2026-06): "flat"/unknown is
+            # NEUTRAL, not a mismatch — the old `trend != want` check blocked every
+            # signal in ranging markets (where HTF is flat by definition), including
+            # all scalps. Reuses htf_trend fetched above (no second fetch).
+            if htf_label not in (None, "off"):
+                opposite_trend = "down" if sig.side == "buy" else "up"
+                if htf_trend == opposite_trend:
+                    want = "up" if sig.side == "buy" else "down"
                     await db.bots.update_one({"_id": bot["_id"]}, {"$set": {
                         "last_scan_at": now_iso(),
-                        "last_scan_result": f"htf_mismatch:{htf}({trend or 'unknown'} vs need {want})",
+                        "last_scan_result": f"htf_mismatch:{htf_label}({htf_trend} vs need {want})",
                         "last_mode": _mode_badge,
                     }})
                     continue
@@ -2725,6 +2742,15 @@ async def on_startup():
     )
     if backfill_res.modified_count:
         log.info("backfilled min_confidence=0.5 on %d bots", backfill_res.modified_count)
+
+    # P1 fix (2026-06): Asia session enabled by default — add it to existing bots
+    # whose session list predates the change.
+    asia_res = await db.bots.update_many(
+        {"sessions": {"$type": "array", "$nin": ["asia"]}},
+        {"$addToSet": {"sessions": "asia"}},
+    )
+    if asia_res.modified_count:
+        log.info("backfilled asia session on %d bots", asia_res.modified_count)
 
     # Backfill referral_code for existing users lacking it
     async for u in db.users.find({"referral_code": {"$in": [None, ""]}}, {"_id": 1}):

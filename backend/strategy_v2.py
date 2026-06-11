@@ -188,9 +188,9 @@ class StrategyV2Config:
     tp_atr: float = 3.0          # Higher RR than v1 (2.5 → 3.0) — institutional bias
     min_confidence: float = 0.55
     scalp_sl_atr: float = 1.0
-    scalp_tp_atr: float = 1.5
+    scalp_tp_atr: float = 1.3   # P2 fix (2026-06): scalp RR band 1.2-1.5 — reachable inside hold window
     scalp_min_confidence: float = 0.55
-    max_hold_minutes_scalp: int = 45
+    max_hold_minutes_scalp: int = 30  # P2 fix (2026-06): 45 → 30
     max_hold_minutes_swing: int = 480  # 8h cap on swings
     # v1.8 — Conservative live-forward filters. Toggled via STRATEGY_CONSERVATIVE env at server startup.
     require_displacement: bool = False        # BOS only valid if a displacement bar confirms
@@ -217,9 +217,11 @@ def conservative_config() -> "StrategyV2Config":
                                         # Combined with require_htf_alignment + require_displacement, the
                                         # surviving signals at 0.62-0.71 are filtered by structure not just score.
         scalp_sl_atr=1.0,
-        scalp_tp_atr=2.0,
+        scalp_tp_atr=1.3,               # P2 fix (2026-06): 2.0 → 1.3 — a 2×ATR scalp target was
+                                        # statistically unreachable inside the hold window; scalps
+                                        # were dying by max_hold timeout instead of hitting TP.
         scalp_min_confidence=0.55,      # 0.78 → 0.55 — scalps need looser bar to be useful
-        max_hold_minutes_scalp=60,      # 45 → 60 — give scalps time to develop
+        max_hold_minutes_scalp=30,      # P2 fix (2026-06): 60 → 30 — scalps resolve fast or not at all
         max_hold_minutes_swing=360,
         require_displacement=True,      # keep — structural filter, not score-based
         require_fvg_for_bos=False,      # was True; relaxing — FVG isn't always present on real BOS retests
@@ -323,8 +325,16 @@ def generate_signal_v2(
         out = _setup_bos_retest(candles, cfg, ef, es, r, a, regime, session, bos, fvg, disp, htf_trend, ctx)
     elif squeeze:
         out = _setup_range_breakout(candles, cfg, ef, es, r, a, regime, session, disp, htf_trend, ctx)
+        # P0 fix (2026-06): scalp activation — if compression has no breakout yet,
+        # mean-reversion scalps inside the squeeze are valid opportunities.
+        if out is None:
+            out = _setup_rsi_scalp(candles, cfg, r, a, regime, session, htf_trend, ctx)
     else:
         out = _setup_liquidity_reversal(candles, cfg, ef, es, r, a, regime, session, sweep, htf_trend, ctx)
+        # P0 fix (2026-06): scalp activation — ranging bars without a sweep event
+        # fall through to the RSI mean-reversion scalp (ported from engine v1).
+        if out is None:
+            out = _setup_rsi_scalp(candles, cfg, r, a, regime, session, htf_trend, ctx)
 
     if out is None:
         return None
@@ -333,7 +343,7 @@ def generate_signal_v2(
     # ──────────────────────────────────────────────────────────────────────
     # FIX #3 — Support/Resistance reversal check (post-setup gate) + LOGGING
     # ──────────────────────────────────────────────────────────────────────
-    sr = _sr_check(candles, r, sig.side, last_close=closes[-1])
+    sr = _sr_check(candles, r, sig.side, last_close=closes[-1], atr_v=a[-1])
     sr_res = sr.get("resistance")
     sr_sup = sr.get("support")
     last_c = closes[-1]
@@ -377,13 +387,19 @@ def generate_signal_v2(
             prev_low = min(c["l"] for c in prev_window)
             last_high = candles[-1]["h"]
             last_low = candles[-1]["l"]
-            if sig.side == "sell" and last_high > prev_high:
-                log.info("[S/R BLOCK] SELL @ %.5f rejected — current bar broke prev-resistance %.5f (last_high=%.5f)",
-                         last_c, prev_high, last_high)
+            last_close_px = candles[-1]["c"]
+            # P0 fix (2026-06): only block when the bar CLOSED beyond the broken
+            # level (a true breakout — original June-8 protection). A bar that
+            # pierces the level but closes back inside is a liquidity SWEEP, which
+            # is exactly the reversal entry the scalp setup trades. The old check
+            # blocked the sweep setup's own entry condition, killing all scalps.
+            if sig.side == "sell" and last_high > prev_high and last_close_px > prev_high:
+                log.info("[S/R BLOCK] SELL @ %.5f rejected — bar broke AND closed above prev-resistance %.5f (close=%.5f)",
+                         last_c, prev_high, last_close_px)
                 return None
-            if sig.side == "buy" and last_low < prev_low:
-                log.info("[S/R BLOCK] BUY @ %.5f rejected — current bar broke prev-support %.5f (last_low=%.5f)",
-                         last_c, prev_low, last_low)
+            if sig.side == "buy" and last_low < prev_low and last_close_px < prev_low:
+                log.info("[S/R BLOCK] BUY @ %.5f rejected — bar broke AND closed below prev-support %.5f (close=%.5f)",
+                         last_c, prev_low, last_close_px)
                 return None
 
     # ──────────────────────────────────────────────────────────────────────
@@ -395,9 +411,11 @@ def generate_signal_v2(
         return None
 
     # ──────────────────────────────────────────────────────────────────────
-    # FIX #1 — Enforce minimum 1:2 R:R on EVERY signal
+    # FIX #1 — Enforce minimum R:R floor on EVERY signal.
+    # P2 fix (2026-06): per-mode floor — swings keep 1:2; scalps use 1:1.3
+    # (a 2R target on a 30-min scalp is unreachable and just times out).
     # ──────────────────────────────────────────────────────────────────────
-    sig = _enforce_min_rr(sig, min_rr=2.0)
+    sig = _enforce_min_rr(sig, min_rr=2.0 if sig.mode == "swing" else 1.3)
 
     log.info("[SIGNAL FIRED] %s · conf=%.2f · regime=%s · sess=%s · entry=%.5f sl=%.5f tp=%.5f · reason=%s",
              sig.side.upper(), sig.confidence, sig.regime, sig.session,
@@ -450,8 +468,8 @@ def _enforce_min_rr(sig: "GeneratedSignal", *, min_rr: float = 2.0) -> "Generate
 # FIX #3 helper — S/R reversal logic
 # ============================================================================
 def _sr_check(candles: List[Candle], rsi_vals: List[float], side: Side,
-              *, last_close: float, lookback: int = 20,
-              near_pct: float = 0.003) -> Dict[str, Any]:
+              *, last_close: float, atr_v: float = 0.0, lookback: int = 20,
+              near_atr_mult: float = 0.5, near_pct: float = 0.003) -> Dict[str, Any]:
     """Returns one of:
       {'action':'ok'}                       — far from S/R, proceed as-is
       {'action':'block', 'reason':'near_resistance' | 'near_support'}
@@ -465,8 +483,16 @@ def _sr_check(candles: List[Candle], rsi_vals: List[float], side: Side,
     window = candles[-lookback:]
     resistance = max(c["h"] for c in window)
     support = min(c["l"] for c in window)
-    near_res = (resistance - last_close) / max(last_close, 1e-9) <= near_pct
-    near_sup = (last_close - support) / max(last_close, 1e-9) <= near_pct
+    # P1 fix (2026-06): ATR-scaled proximity (0.5 × ATR) instead of a fixed 0.3%.
+    # The fixed % was wider than the entire 20-bar range on FX M15 pairs, leaving
+    # no neutral zone — every trend signal was "near" S/R and got blocked.
+    if atr_v > 0:
+        near_dist = near_atr_mult * atr_v
+        near_res = (resistance - last_close) <= near_dist
+        near_sup = (last_close - support) <= near_dist
+    else:
+        near_res = (resistance - last_close) / max(last_close, 1e-9) <= near_pct
+        near_sup = (last_close - support) / max(last_close, 1e-9) <= near_pct
     last_c = candles[-1]
     bearish = last_c["c"] < last_c["o"]
     bullish = last_c["c"] > last_c["o"]
@@ -682,6 +708,71 @@ def _setup_liquidity_reversal(candles, cfg: StrategyV2Config, ef, es, r, a,
     ctx.scores = {"base": base, "sweep": sweep_s, "rsi": rsi_s,
                   "session": session_s, "htf": htf_s}
     reason = f"Liquidity sweep {side.upper()} · RSI {r[-1]:.1f}"
+    sig = GeneratedSignal(
+        side=side, entry=entry, sl=sl, tp=tp, confidence=conf,
+        regime=regime, session=session, reason=reason,
+        mode="scalp", max_hold_minutes=cfg.max_hold_minutes_scalp,
+    )
+    return sig, ctx
+
+
+# ============================================================================
+# Setup #4 — RSI Mean-Reversion Scalp (RANGING / COMPRESSION fallback)
+# ============================================================================
+def _setup_rsi_scalp(candles, cfg: StrategyV2Config, r, a,
+                     regime: Regime, session: Session,
+                     htf_trend, ctx: SignalContext):
+    """P0 — Scalp activation (2026-06). Port of the engine-v1 range-mode scalp
+    into the v2 router. Fires in ranging/compression regimes when no structural
+    setup (sweep / breakout) is present on the bar:
+      • RSI < 35 + bullish confirmation close → BUY
+      • RSI > 65 + bearish confirmation close → SELL
+      • SL = scalp_sl_atr × ATR · TP = scalp_tp_atr × ATR (1.3R floor applied later)
+      • max hold = cfg.max_hold_minutes_scalp (bridge force-closes after that)
+    Safety preserved: require_htf_alignment hard-block still applies; the S/R
+    gate, FIX #3b, strong-trend block and all scanner gates run downstream.
+    """
+    n = len(candles)
+    if n < 2:
+        return None
+    atr_v = a[-1]
+    if atr_v <= 0:
+        return None
+    last, prev = candles[-1], candles[-2]
+    rsi_now = r[-1]
+    side: Optional[Side] = None
+    depth = 0.0
+    if rsi_now < 35 and last["c"] > prev["c"]:
+        side = "buy"
+        depth = (35.0 - rsi_now) / 35.0
+    elif rsi_now > 65 and last["c"] < prev["c"]:
+        side = "sell"
+        depth = (rsi_now - 65.0) / 35.0
+    if side is None:
+        return None
+
+    # Safety: never scalp against a decisive HTF trend (mirrors the sweep gate).
+    htf_aligned: Optional[bool] = None
+    if htf_trend and htf_trend != "flat":
+        want = "up" if side == "buy" else "down"
+        htf_aligned = (htf_trend == want)
+        if cfg.require_htf_alignment and not htf_aligned:
+            return None
+    ctx.htf_aligned = htf_aligned
+
+    entry = last["c"]
+    sl = entry - atr_v * cfg.scalp_sl_atr if side == "buy" else entry + atr_v * cfg.scalp_sl_atr
+    tp = entry + atr_v * cfg.scalp_tp_atr if side == "buy" else entry - atr_v * cfg.scalp_tp_atr
+
+    base = 0.50
+    rsi_s = 0.08 + min(0.15, depth * 0.5)   # deeper extreme → higher confidence
+    session_s = 0.03 if session in ("london", "new_york", "overlap") else -0.02
+    htf_s = 0.04 if htf_aligned else 0.0
+    conf = max(0.0, min(0.99, base + rsi_s + session_s + htf_s))
+    if conf < cfg.scalp_min_confidence:
+        return None
+    ctx.scores = {"base": base, "rsi": rsi_s, "session": session_s, "htf": htf_s}
+    reason = f"RSI-scalp {side.upper()} · RSI {rsi_now:.1f} · mean-reversion ({regime})"
     sig = GeneratedSignal(
         side=side, entry=entry, sl=sl, tp=tp, confidence=conf,
         regime=regime, session=session, reason=reason,

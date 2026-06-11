@@ -12,7 +12,16 @@ User imported a full-stack auto-trading bot (React + FastAPI + MongoDB + MT5 bri
 
 ## Work Log
 - 2026-06 (prev session): ZIP extracted, deps installed, services deployed, env vars set, admin seeded. Tested via curl/mongosh.
-- 2026-06 (this session): DEEP AUDIT (analysis only, NO code changes) of signal starvation. Reliability rated 58/100.
+- 2026-06 (this session): DEEP AUDIT (analysis only). Reliability rated 58/100.
+- 2026-06-11: ALL 7 AUDIT FIXES IMPLEMENTED (user-approved, safety features untouched):
+  - P0-1: daily_loss_limit = % of equity (server.py gate #4; flat-USD fallback if no equity; matches frontend "DAILY LOSS %" label)
+  - P0-2: Scalp activated in v2 — new `_setup_rsi_scalp` (RSI<35 buy / >65 sell + confirmation bar) as router fallback in ranging AND compression regimes; HTF hard-block preserved
+  - P0-3: FIX #3b refined — blocks only when bar CLOSED beyond broken level (true breakout); sweeps (pierce + close back inside) now pass
+  - P1-4: S/R gate ATR-scaled (0.5×ATR) instead of fixed 0.3% (`_sr_check` atr_v param)
+  - P1-5: Asia enabled — DEFAULT_SESSIONS includes asia, startup backfill $addToSet on existing bots, current_session: 21-24 UTC = asia (was "off"); 0.5× lot via existing session_mult
+  - P2-6: Scanner HTF gate blocks only DECISIVELY opposite trend (flat/None = neutral); htf_trend fetched once (dedupe)
+  - P2-7: Scalp RR floor 1.3 (swing keeps 2.0), scalp_tp_atr 1.3, max_hold_scalp 30 min
+  - Tests: /app/backend/tests/test_audit_fixes.py — 13/13 pass. test_risk_gates.py script ALL PASS. test_htf_confirmation failure verified PRE-EXISTING (fails on unmodified code too). HTTP legacy tests point to stale preview URL (pre-existing env issue).
 
 ## Audit Findings (key — full report delivered in chat)
 1. Scalp mode dead code under v2: engine.py `_generate_scalp` / `enable_scalping_in_ranges` only used in v1 path; v2's only scalp = liquidity sweep reversal.
@@ -25,14 +34,11 @@ User imported a full-stack auto-trading bot (React + FastAPI + MongoDB + MT5 bri
 8. `bar_close_only=True` is dead config — never referenced; scanner acts on forming bars.
 9. `recent_win_rate` plumbed into adaptive_lot but always passed None (server.py L2272).
 
-## User-Proposed Fix Sequence (awaiting user decision — DO NOT implement until approved)
-1. Daily loss limit → % of equity (2-3%)
-2. Resolve FIX #3b ↔ sweep contradiction
-3. ATR-scale near_pct in S/R gate
-4. HTF: dedupe gates, "flat" = neutral
-5. Scalp RR floor 1:1–1.5
-6. Asia: default sessions + fix 21-24 UTC hole + revive v1 scalp engine in v2
-7. Implement bar_close_only
+## Backlog (not yet approved/implemented)
+- Implement dead `bar_close_only` flag (scanner still evaluates forming bars)
+- Wire `recent_win_rate` into adaptive_lot (currently always None)
+- Trade-frequency profiles (Conservative/Balanced/Aggressive)
+- Per-gate "signals funnel" diagnostic dashboard
 
 ## Constraints
 - STRICT: user is highly protective of codebase. No refactoring/improvements beyond explicitly approved fixes.

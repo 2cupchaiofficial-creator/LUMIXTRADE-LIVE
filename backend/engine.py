@@ -162,6 +162,10 @@ def current_session(d: Optional[datetime] = None) -> Session:
         return "new_york"
     if 0 <= h < 7:
         return "asia"
+    # P1 fix (2026-06): 21:00-24:00 UTC is early Asia (Sydney open / Tokyo pre-open),
+    # not "off". Previously a 3-hour hard-blocked dead zone every day.
+    if h >= 21:
+        return "asia"
     return "off"
 
 
