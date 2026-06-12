@@ -35,8 +35,9 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from engine import Candle, StrategyConfig, generate_signal, calc_lot, ema, atr, detect_regime
 from marketdata import fetch_candles, fetch_price, store_candles, init_db as _md_init
-from data_validation import validate_candles
+from data_validation import validate_candles, TF_MINUTES
 from strategy_v2 import generate_signal_v2, StrategyV2Config, conservative_config
+from backtest_v2 import simulate_backtest
 from risk_engine import adaptive_lot, volatility_gate, bridge_health
 import notifications as notify_svc
 
@@ -2031,6 +2032,48 @@ async def _htf_trend(pair: str, htf: str) -> Optional[str]:
     return "flat"
 
 
+def _drop_forming_bar(candles: List[dict], timeframe: str, now_ms: int) -> List[dict]:
+    """P0 (2026-06) — BAR-CLOSE-ONLY: the bridge streams the still-forming bar
+    (MT5 copy_rates_from_pos index 0 is the live bar). Acting on it caused phantom
+    entries — a displacement/sweep/RSI condition visible mid-bar can vanish by the
+    close, leaving a signal with SL/TP computed from an incomplete bar. Drop the
+    last candle whenever its period hasn't completed yet."""
+    if not candles:
+        return candles
+    tf_ms = TF_MINUTES.get((timeframe or "M15").upper(), 15) * 60_000
+    if int(candles[-1]["t"]) + tf_ms > now_ms:
+        return candles[:-1]
+    return candles
+
+
+async def _funnel_record(bot: dict, reason: str) -> None:
+    """P1 (2026-06) — Funnel telemetry: persists the deepest stage each bot reached
+    per bar-period, making "why didn't we trade today?" answerable with data.
+    One doc per (bot, bar-period): the 3-min scheduler re-scans the same bar without
+    double-counting (upsert). Cooldown stages never overwrite a richer stage (e.g.
+    signal_created) recorded earlier in the same bar. TTL-expired after 14 days."""
+    try:
+        tf_min = TF_MINUTES.get((bot.get("timeframe") or "M15").upper(), 15)
+        now = now_utc()
+        bucket_ms = tf_min * 60_000
+        bar_bucket = int(now.timestamp() * 1000) // bucket_ms * bucket_ms
+        stage = reason.split(":", 1)[0].split(" ", 1)[0]
+        doc = {
+            "user_id": bot.get("user_id"),
+            "bot_id": bot["_id"], "pair": bot.get("pair"),
+            "timeframe": bot.get("timeframe"),
+            "bar_t": bar_bucket, "stage": stage, "detail": reason[:160],
+            "date": now.strftime("%Y-%m-%d"), "ts": now,
+        }
+        key = {"_id": f"{bot['_id']}:{bar_bucket}"}
+        if stage in ("cooldown", "pair_dir_cooldown"):
+            await db.funnel.update_one(key, {"$setOnInsert": doc}, upsert=True)
+        else:
+            await db.funnel.update_one(key, {"$set": doc}, upsert=True)
+    except Exception as e:
+        log.debug("funnel record failed: %s", e)
+
+
 async def _scan_and_persist(bots: List[dict]) -> int:
     created = 0
     cached_symbols: set[str] = set()
@@ -2047,6 +2090,7 @@ async def _scan_and_persist(bots: List[dict]) -> int:
                     "last_scan_at": now_iso(),
                     "last_scan_result": news_reason,
                 }})
+                await _funnel_record(bot, news_reason)
                 continue
             # 2) EQUITY DRAWDOWN HALT (per user — auto-resumes Monday UTC)
             if user_id not in dd_cache:
@@ -2056,6 +2100,7 @@ async def _scan_and_persist(bots: List[dict]) -> int:
                     "last_scan_at": now_iso(),
                     "last_scan_result": f"halt:{dd_cache[user_id].get('reason')}",
                 }})
+                await _funnel_record(bot, f"halt:{dd_cache[user_id].get('reason')}")
                 continue
             # 3) MAX POSITIONS per bot
             if bot.get("max_positions"):
@@ -2065,6 +2110,7 @@ async def _scan_and_persist(bots: List[dict]) -> int:
                         "last_scan_at": now_iso(),
                         "last_scan_result": f"max_positions_reached:{open_n}/{int(bot['max_positions'])}",
                     }})
+                    await _funnel_record(bot, f"max_positions_reached:{open_n}/{int(bot['max_positions'])}")
                     continue
             # 4) DAILY LOSS LIMIT per bot (realized + floating, UTC day).
             # P0 fix (2026-06): the limit is a PERCENT of account equity (matches the
@@ -2090,14 +2136,19 @@ async def _scan_and_persist(bots: List[dict]) -> int:
                         continue
             cfg = StrategyConfig.from_dict(bot.get("strategy_config") or {})
             candles = await fetch_candles(bot["pair"], bot["timeframe"], 200)
-            # ---- Data validation (NEVER trade on bad/stale data) ----
             now_ms = int(now_utc().timestamp() * 1000)
+            # P0 (2026-06): BAR-CLOSE-ONLY — drop the still-forming bar before
+            # validation/strategy (uses the previously dead cfg.bar_close_only flag).
+            if STRATEGY_V2_CFG.bar_close_only:
+                candles = _drop_forming_bar(candles, bot["timeframe"], now_ms)
+            # ---- Data validation (NEVER trade on bad/stale data) ----
             v = validate_candles(candles, bot["timeframe"], now_ms)
             if not v.ok:
                 await db.bots.update_one({"_id": bot["_id"]}, {"$set": {
                     "last_scan_at": now_iso(),
                     "last_scan_result": f"data_unavailable:{v.reason}",
                 }})
+                await _funnel_record(bot, f"data_unavailable:{v.reason}")
                 notify_svc.notify("data_bad", pair=bot["pair"], reason=v.reason)
                 continue
             # ---- Volatility circuit breaker ----
@@ -2108,6 +2159,7 @@ async def _scan_and_persist(bots: List[dict]) -> int:
                     "last_scan_at": now_iso(),
                     "last_scan_result": vol_block,
                 }})
+                await _funnel_record(bot, vol_block)
                 notify_svc.notify("vol_halt", pair=bot["pair"],
                                   ratio=(_a_pre[-1] / max(_a_pre[-2], 1e-9)))
                 continue
@@ -2116,6 +2168,7 @@ async def _scan_and_persist(bots: List[dict]) -> int:
                     "last_scan_at": now_iso(),
                     "last_scan_result": "insufficient_data",
                 }})
+                await _funnel_record(bot, "insufficient_data")
                 continue
             if bot["pair"] not in cached_symbols:
                 cached_symbols.add(bot["pair"])
@@ -2148,6 +2201,7 @@ async def _scan_and_persist(bots: List[dict]) -> int:
                     "last_scan_at": now_iso(),
                     "last_scan_result": f"cooldown:{cooldown_min}min",
                 }})
+                await _funnel_record(bot, f"cooldown:{cooldown_min}min")
                 continue
 
             # FIX #2 — Per-(pair, direction) cooldown across ALL the user's bots.
@@ -2203,6 +2257,7 @@ async def _scan_and_persist(bots: List[dict]) -> int:
                     "last_scan_result": f"no_setup ({_regime})",
                     "last_mode": _mode_badge,
                 }})
+                await _funnel_record(bot, f"no_setup ({_regime})")
                 continue
             if sig.session not in (bot.get("sessions") or DEFAULT_SESSIONS):
                 await db.bots.update_one({"_id": bot["_id"]}, {"$set": {
@@ -2210,6 +2265,7 @@ async def _scan_and_persist(bots: List[dict]) -> int:
                     "last_scan_result": f"session_filtered:{sig.session}",
                     "last_mode": _mode_badge,
                 }})
+                await _funnel_record(bot, f"session_filtered:{sig.session}")
                 continue
             # FIX #2 — Block same-(pair, direction) duplicates fired by sibling bots
             # within 1 closed bar window. If user has a SELL fired ≤ TF minutes ago,
@@ -2220,6 +2276,7 @@ async def _scan_and_persist(bots: List[dict]) -> int:
                     "last_scan_result": f"pair_dir_cooldown:{pair}:{sig.side}",
                     "last_mode": _mode_badge,
                 }})
+                await _funnel_record(bot, f"pair_dir_cooldown:{pair}:{sig.side}")
                 continue
             # FIX #2 — If an OPEN position exists on this pair in the OPPOSITE
             # direction, the new signal must have meaningfully higher confidence
@@ -2241,6 +2298,7 @@ async def _scan_and_persist(bots: List[dict]) -> int:
                         "last_scan_result": f"opposite_open:{opposite}@{existing_conf:.2f}_need_+0.10",
                         "last_mode": _mode_badge,
                     }})
+                    await _funnel_record(bot, f"opposite_open:{opposite}@{existing_conf:.2f}_need_+0.10")
                     continue
             # 5) CORRELATION FILTER — block if group already has CORRELATION_LIMIT same-direction trades
             corr_reason = await _correlation_blocked(bot["user_id"], bot["pair"], sig.side)
@@ -2250,6 +2308,7 @@ async def _scan_and_persist(bots: List[dict]) -> int:
                     "last_scan_result": corr_reason,
                     "last_mode": _mode_badge,
                 }})
+                await _funnel_record(bot, corr_reason)
                 continue
             # 6) HIGHER-TF CONFIRMATION — block only when the higher-TF trend is
             # DECISIVELY opposite the signal. P2 fix (2026-06): "flat"/unknown is
@@ -2331,6 +2390,7 @@ async def _scan_and_persist(bots: List[dict]) -> int:
                 "last_scan_result": f"signal_created:{sig.side} ({sig.confidence:.2f}) [{sig.mode}]",
                 "last_mode": _mode_badge,
             }})
+            await _funnel_record(bot, f"signal_created:{sig.side} ({sig.confidence:.2f}) [{sig.mode}]")
             created += 1
         except Exception as e:
             log.warning("scan error for bot %s: %s", bot.get("_id"), e)
@@ -2423,6 +2483,96 @@ async def bridge_stream_config(request: Request):
         "pairs": items,
         "count": len(items),
     }
+
+
+# ---------- Funnel telemetry + Backtest v2 (P0/P1, 2026-06) ----------
+@api.get("/system/funnel")
+async def system_funnel(days: int = 1, user: dict = Depends(get_current_user)):
+    """P1 (2026-06) — Signals-funnel diagnostic: how many bar-evaluations died at
+    each gate over the last N days (≤14). Admins see all users; users see their own."""
+    days = max(1, min(14, int(days)))
+    since = (now_utc() - timedelta(days=days - 1)).strftime("%Y-%m-%d")
+    match: Dict[str, Any] = {"date": {"$gte": since}}
+    if user.get("role") != "admin":
+        match["user_id"] = user["_id"]
+    stages: Dict[str, int] = {}
+    async for row in db.funnel.aggregate([
+        {"$match": match},
+        {"$group": {"_id": "$stage", "n": {"$sum": 1}}},
+        {"$sort": {"n": -1}},
+    ]):
+        stages[row["_id"]] = int(row["n"])
+    by_bot: List[dict] = []
+    async for row in db.funnel.aggregate([
+        {"$match": match},
+        {"$group": {"_id": {"bot": "$bot_id", "pair": "$pair", "tf": "$timeframe",
+                            "stage": "$stage"}, "n": {"$sum": 1}}},
+        {"$sort": {"_id.bot": 1, "n": -1}},
+    ]):
+        by_bot.append({"bot_id": row["_id"]["bot"], "pair": row["_id"]["pair"],
+                       "timeframe": row["_id"]["tf"], "stage": row["_id"]["stage"],
+                       "count": int(row["n"])})
+    by_date: List[dict] = []
+    async for row in db.funnel.aggregate([
+        {"$match": match},
+        {"$group": {"_id": {"date": "$date", "stage": "$stage"}, "n": {"$sum": 1}}},
+        {"$sort": {"_id.date": 1}},
+    ]):
+        by_date.append({"date": row["_id"]["date"], "stage": row["_id"]["stage"],
+                        "count": int(row["n"])})
+    return {"since": since, "days": days, "stages": stages,
+            "by_bot": by_bot, "by_date": by_date}
+
+
+class BacktestV2Request(BaseModel):
+    pair: str
+    timeframe: str = "M5"
+    spread: Optional[float] = None              # price units; None = per-pair default
+    higher_tf_confirmation: Optional[str] = "off"
+    max_bars: int = 3000
+
+
+@api.post("/backtest/run")
+async def backtest_v2_run(body: BacktestV2Request, user: dict = Depends(get_current_user)):
+    """P0 (2026-06) — Replay the LIVE v2 strategy over stored broker candles.
+    Proves win rate / expectancy / RR per setup before any constant goes live.
+    History grows daily as the bridge streams; ≥150 bars required."""
+    pair = body.pair.upper().strip()
+    tf = body.timeframe.upper().strip()
+    candles = await fetch_candles(pair, tf, min(max(int(body.max_bars), 300), 5000))
+    if len(candles) < 150:
+        raise HTTPException(400, f"Insufficient candle history for {pair} {tf}: "
+                                 f"{len(candles)} bars stored (need ≥150). History "
+                                 f"accumulates as the bridge streams this pair/TF.")
+    htf = (body.higher_tf_confirmation or "off").upper()
+    htf_candles = await fetch_candles(pair, htf, 1000) if htf not in ("OFF", "") else []
+    loop = asyncio.get_running_loop()
+    report = await loop.run_in_executor(
+        None,
+        lambda: simulate_backtest(candles, STRATEGY_V2_CFG, timeframe=tf, pair=pair,
+                                  spread=body.spread, htf_candles=htf_candles),
+    )
+    doc = {"_id": str(uuid.uuid4()), "user_id": user["_id"], "pair": pair,
+           "timeframe": tf,
+           "params": report["params"] | {"htf": htf},
+           "summary": report["summary"], "by_setup": report["by_setup"],
+           "by_session": report["by_session"], "by_mode": report["by_mode"],
+           "created_at": now_iso()}
+    await db.backtests.insert_one(doc)
+    report["id"] = doc["_id"]
+    return report
+
+
+@api.get("/backtest/history")
+async def backtest_v2_history(user: dict = Depends(get_current_user)):
+    rows = await db.backtests.find({"user_id": user["_id"]}) \
+        .sort("created_at", -1).limit(20).to_list(20)
+    out = []
+    for r in rows:
+        d = _strip_id(r)
+        d["id"] = r["_id"]
+        out.append(d)
+    return out
 
 
 @api.get("/diag/candles")
@@ -2751,6 +2901,14 @@ async def on_startup():
     )
     if asia_res.modified_count:
         log.info("backfilled asia session on %d bots", asia_res.modified_count)
+
+    # P1 (2026-06): funnel telemetry + backtest indexes (idempotent)
+    try:
+        await db.funnel.create_index("ts", expireAfterSeconds=14 * 86400)
+        await db.funnel.create_index([("user_id", 1), ("date", 1)])
+        await db.backtests.create_index([("user_id", 1), ("created_at", -1)])
+    except Exception as e:
+        log.warning("index creation: %s", e)
 
     # Backfill referral_code for existing users lacking it
     async for u in db.users.find({"referral_code": {"$in": [None, ""]}}, {"_id": 1}):

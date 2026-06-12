@@ -18,6 +18,12 @@ Run:
 The bridge polls Aurum every 5 seconds for new signals and executes them on MT5.
 Closed trades and fills are reported back automatically. Your MT5 password never leaves this machine.
 
+NEW IN v1.9:
+  - Spread-vs-SL protection: rejects execution when the live spread exceeds
+    AURUM_MAX_SPREAD_SL_PCT (default 20) percent of the signal's stop distance.
+    Protects scalp economics — a 2-pip spread on a 10-pip scalp stop is 20% of
+    the risk gone before the trade starts. Absolute per-pair caps still apply.
+
 NEW IN v1.4:
   - Partial close at +1R: once floating profit reaches the initial risk (1R = USD risked
     on the trade based on initial SL distance and initial volume), the bridge closes
@@ -62,7 +68,7 @@ except ImportError:
 import requests
 
 # ----- config -----
-BRIDGE_VERSION = "1.8.1"
+BRIDGE_VERSION = "1.9.0"
 API_KEY  = os.environ.get("AURUM_API_KEY")
 API_URL  = (os.environ.get("AURUM_API_URL") or "").rstrip("/")
 MT5_LOGIN    = os.environ.get("MT5_LOGIN")
@@ -469,6 +475,19 @@ def execute(sig: Dict[str, Any]) -> None:
         log.warning("SPREAD BLOCK %s · spread=%.5f > cap=%.5f", broker_sym, spread_price, max_spread)
         report("reject", {"signal_id": sig["id"],
                           "reason": f"spread_block:{spread_price:.5f}>{max_spread:.5f}"})
+        return
+
+    # ---- v1.9 SPREAD vs SL-DISTANCE PROTECTION (P2, 2026-06) ----
+    # Absolute caps don't protect tight scalp stops: a 2-pip spread on a 10-pip
+    # scalp SL is 20% of the risk before the trade even starts. Reject when the
+    # spread exceeds AURUM_MAX_SPREAD_SL_PCT (default 20) percent of the stop distance.
+    _sl_dist_sig = abs(sig_entry - sig_sl) if sig_entry else 0.0
+    _max_sl_frac = max(0.0, float(os.environ.get("AURUM_MAX_SPREAD_SL_PCT", "20"))) / 100.0
+    if _sl_dist_sig > 0 and _max_sl_frac > 0 and spread_price > _sl_dist_sig * _max_sl_frac:
+        log.warning("SPREAD/SL BLOCK %s · spread=%.5f > %.0f%% of SL distance %.5f",
+                    broker_sym, spread_price, _max_sl_frac * 100, _sl_dist_sig)
+        report("reject", {"signal_id": sig["id"],
+                          "reason": f"spread_vs_sl:{spread_price:.5f}>{_max_sl_frac:.0%}_of_{_sl_dist_sig:.5f}"})
         return
 
     # Clamp lot to broker constraints

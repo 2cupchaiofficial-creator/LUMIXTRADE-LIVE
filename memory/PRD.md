@@ -34,11 +34,20 @@ User imported a full-stack auto-trading bot (React + FastAPI + MongoDB + MT5 bri
 8. `bar_close_only=True` is dead config — never referenced; scanner acts on forming bars.
 9. `recent_win_rate` plumbed into adaptive_lot but always passed None (server.py L2272).
 
+- 2026-06-12: P0/P1/P2 BUILD (user-approved 6-item list) — all tested (22/22 pytest + risk-gates regression + live API):
+  - P0-1 Backtest engine v2: NEW `/app/backend/backtest_v2.py` (pure `simulate_backtest`) — replays LIVE v2 strategy over stored broker candles with full production fidelity (200-bar window, bar-close-only, next-bar-open fills + bridge SL/TP re-anchor, BE@0.5R, 50% partial@1R, max-hold, SL-before-TP same-bar, spread cost). Endpoints: POST /api/backtest/run {pair,timeframe,spread?,higher_tf_confirmation?,max_bars?}, GET /api/backtest/history. Persists to db.backtests. Legacy v1 Dukascopy backtest.py + /api/bots/{id}/backtest UNTOUCHED.
+  - P0-2 Trend-pullback scalp: `_setup_trend_pullback` in strategy_v2.py — trending regimes, EMA21 tag (±0.25 ATR) + resumption bar + RSI 35-62/38-65 + pullback depth ≥0.8 ATR, SL 1×ATR, TP 1.3×ATR, 30-min hold. Router: BOS first, pullback fallback. HTF hard-block preserved.
+  - P0-3 Bar-close-only: `_drop_forming_bar` in server.py wired into scan via the previously dead cfg.bar_close_only flag.
+  - P1-4 Funnel telemetry: `_funnel_record` + 16 scan-stage hooks → db.funnel (upsert per bot+bar-period, cooldowns never overwrite richer stages, TTL 14d). Endpoint GET /api/system/funnel?days=N (admin=all users).
+  - P1-5 Partial TP+BE: VERIFIED ALREADY LIVE in bridge v1.8.1 (BE@+0.5R, 50% partial@+1R + BE) — no change needed.
+  - P2-6 Spread-vs-SL filter: bridge v1.9.0 — rejects when spread > AURUM_MAX_SPREAD_SL_PCT (default 20%) of stop distance. MIN_BRIDGE_VERSION stays 1.8.1 (no forced upgrade). USER MUST RE-DOWNLOAD bridge on VPS to activate. Both copies (backend/static + frontend/public) synced.
+
 ## Backlog (not yet approved/implemented)
-- Implement dead `bar_close_only` flag (scanner still evaluates forming bars)
+- Frontend UI for backtest results + funnel dashboard (API-only today)
 - Wire `recent_win_rate` into adaptive_lot (currently always None)
 - Trade-frequency profiles (Conservative/Balanced/Aggressive)
-- Per-gate "signals funnel" diagnostic dashboard
+- Live news calendar feed (news_calendar.json is static)
+- S/R zones clustering + HTF levels; ATR trailing for swings; smart timeout exits
 
 ## Constraints
 - STRICT: user is highly protective of codebase. No refactoring/improvements beyond explicitly approved fixes.

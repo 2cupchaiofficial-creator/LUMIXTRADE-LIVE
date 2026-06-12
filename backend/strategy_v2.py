@@ -323,6 +323,11 @@ def generate_signal_v2(
     # ROUTER
     if regime in ("trending_up", "trending_down"):
         out = _setup_bos_retest(candles, cfg, ef, es, r, a, regime, session, bos, fvg, disp, htf_trend, ctx)
+        # P0 fix (2026-06): trend-pullback continuation scalp — BOS bars are rare;
+        # live-forward data showed bots idling in `no_setup (trending_up)` for hours.
+        # The bread-and-butter trend entry is the pullback to EMA21 + resumption bar.
+        if out is None:
+            out = _setup_trend_pullback(candles, cfg, ef, es, r, a, regime, session, htf_trend, ctx)
     elif squeeze:
         out = _setup_range_breakout(candles, cfg, ef, es, r, a, regime, session, disp, htf_trend, ctx)
         # P0 fix (2026-06): scalp activation — if compression has no breakout yet,
@@ -773,6 +778,93 @@ def _setup_rsi_scalp(candles, cfg: StrategyV2Config, r, a,
         return None
     ctx.scores = {"base": base, "rsi": rsi_s, "session": session_s, "htf": htf_s}
     reason = f"RSI-scalp {side.upper()} · RSI {rsi_now:.1f} · mean-reversion ({regime})"
+    sig = GeneratedSignal(
+        side=side, entry=entry, sl=sl, tp=tp, confidence=conf,
+        regime=regime, session=session, reason=reason,
+        mode="scalp", max_hold_minutes=cfg.max_hold_minutes_scalp,
+    )
+    return sig, ctx
+
+
+# ============================================================================
+# Setup #5 — Trend-Pullback Continuation Scalp (TRENDING regimes)
+# ============================================================================
+def _setup_trend_pullback(candles, cfg: StrategyV2Config, ef, es, r, a,
+                          regime: Regime, session: Session,
+                          htf_trend, ctx: SignalContext):
+    """P0 — Trade-frequency fix (2026-06). In a trending regime the BOS-retest
+    setup fires only on rare structural breaks. This setup trades the standard
+    continuation entry instead:
+      • price pulled back ≥ 0.8×ATR from the local extreme into the EMA21 zone
+      • the entry bar tags EMA21 (±0.25×ATR), closes back on the trend side,
+        and closes in the trend direction (resumption bar)
+      • RSI in the healthy-pullback band (35-62 buys / 38-65 sells)
+      • SL = scalp_sl_atr × ATR (1.0) · TP = scalp_tp_atr × ATR · 30-min hold
+    Safety preserved: require_htf_alignment hard-blocks contra-HTF entries; the
+    S/R gate, FIX #3b, strong-trend block and all scanner gates run downstream.
+    """
+    n = len(candles)
+    if n < 30:
+        return None
+    atr_v = a[-1]
+    if atr_v <= 0 or not ef:
+        return None
+    last, prev = candles[-1], candles[-2]
+    e21 = ef[-1]
+    rsi_now = r[-1]
+    side: Side = "buy" if regime == "trending_up" else "sell"
+    touch_band = 0.25 * atr_v
+
+    if side == "buy":
+        if not (35.0 <= rsi_now <= 62.0):
+            return None
+        if last["l"] > e21 + touch_band:          # never reached the EMA21 zone
+            return None
+        if last["c"] <= e21:                       # failed to reclaim the trend side
+            return None
+        if not (last["c"] > last["o"] and last["c"] > prev["c"]):
+            return None                            # no resumption bar
+        local_ext = max(c["h"] for c in candles[-10:-1])
+        pullback_depth = local_ext - last["l"]
+    else:
+        if not (38.0 <= rsi_now <= 65.0):
+            return None
+        if last["h"] < e21 - touch_band:
+            return None
+        if last["c"] >= e21:
+            return None
+        if not (last["c"] < last["o"] and last["c"] < prev["c"]):
+            return None
+        local_ext = min(c["l"] for c in candles[-10:-1])
+        pullback_depth = last["h"] - local_ext
+    if pullback_depth < 0.8 * atr_v:
+        return None                                # noise wiggle, not a real pullback
+
+    # Safety: continuation must agree with the higher timeframe when decisive.
+    htf_aligned: Optional[bool] = None
+    if htf_trend and htf_trend != "flat":
+        want = "up" if side == "buy" else "down"
+        htf_aligned = (htf_trend == want)
+        if cfg.require_htf_alignment and not htf_aligned:
+            return None
+    ctx.htf_aligned = htf_aligned
+
+    entry = last["c"]
+    sl = entry - atr_v * cfg.scalp_sl_atr if side == "buy" else entry + atr_v * cfg.scalp_sl_atr
+    tp = entry + atr_v * cfg.scalp_tp_atr if side == "buy" else entry - atr_v * cfg.scalp_tp_atr
+
+    trend_strength = min(0.08, (abs(ef[-1] - es[-1]) / atr_v) * 0.04) if es else 0.0
+    base = 0.50
+    touch_s = 0.06
+    session_s = 0.03 if session in ("london", "new_york", "overlap") else -0.02
+    htf_s = 0.05 if htf_aligned else 0.0
+    conf = max(0.0, min(0.99, base + touch_s + trend_strength + session_s + htf_s))
+    if conf < cfg.scalp_min_confidence:
+        return None
+    ctx.scores = {"base": base, "touch": touch_s, "trend": round(trend_strength, 3),
+                  "session": session_s, "htf": htf_s}
+    reason = (f"Trend-pullback {side.upper()} · EMA21 tag + resumption · "
+              f"RSI {rsi_now:.1f} ({regime})")
     sig = GeneratedSignal(
         side=side, entry=entry, sl=sl, tp=tp, confidence=conf,
         regime=regime, session=session, reason=reason,

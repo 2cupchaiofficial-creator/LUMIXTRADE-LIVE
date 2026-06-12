@@ -222,9 +222,14 @@ TEST_TAG = "auditfix-test-"
 
 def test_daily_loss_limit_percent_of_equity():
     import server as s
-    db = s.db
+    from motor.motor_asyncio import AsyncIOMotorClient
 
     async def main():
+        # Rebind a fresh motor client to THIS event loop (pytest runs several
+        # asyncio.run() tests per session; motor binds to the loop it first sees)
+        s.client = AsyncIOMotorClient(os.environ["MONGO_URL"])
+        s.db = s.client[os.environ["DB_NAME"]]
+        db = s.db
         # cleanup
         for coll in (db.bots, db.trades, db.signals, db.users, db.mt5_accounts, db.risk_state):
             await coll.delete_many({"_id": {"$regex": f"^{TEST_TAG}"}})
