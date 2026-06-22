@@ -168,6 +168,8 @@ LAST_CANDLES_PUSH: float = 0.0
 OPEN_TICKET_OPENED_AT: Dict[int, float] = {}   # ticket -> unix ts when first seen
 TICKET_MAX_HOLD: Dict[int, int] = {}            # ticket -> max_hold_minutes (from signal)
 SIGNAL_MAX_HOLD: Dict[str, int] = {}            # signal_id -> max_hold_minutes (carry-over)
+# 2026-06-22 audit: per-ticket mode tag → drives dynamic trailing thresholds.
+TICKET_MODE: Dict[int, str] = {}                # ticket -> "scalp" | "swing"
 # Pip size helpers
 def _pip_size(symbol_info) -> float:
     """Returns the 'pip' (not point) for slippage math. JPY pairs: 0.01. FX: 0.0001. Metals: 0.1."""
@@ -189,8 +191,16 @@ def _bool_env(k: str, default: bool) -> bool:
 
 # Trailing stop: once profit reaches START, lock floor of (peak - DISTANCE)
 TRAILING_ENABLED       = _bool_env("AURUM_TRAILING_ENABLED", True)
-TRAILING_START_PROFIT  = float(os.environ.get("AURUM_TRAILING_START_PROFIT", "30"))   # USD
-TRAILING_DISTANCE      = float(os.environ.get("AURUM_TRAILING_DISTANCE", "20"))       # USD
+# 2026-06-22 audit: dynamic per-mode trailing (replaces single static thresholds).
+# Defaults below match user spec: scalp=$5/$2, swing=$30/$15. Legacy single-value
+# envs (TRAILING_START_PROFIT / TRAILING_DISTANCE) still honoured as a fallback
+# when a ticket has no mode tag yet.
+TRAILING_START_PROFIT  = float(os.environ.get("AURUM_TRAILING_START_PROFIT", "30"))   # USD (legacy / fallback)
+TRAILING_DISTANCE      = float(os.environ.get("AURUM_TRAILING_DISTANCE", "20"))       # USD (legacy / fallback)
+TRAIL_SCALP_START      = float(os.environ.get("AURUM_TRAIL_SCALP_START", "5"))
+TRAIL_SCALP_DISTANCE   = float(os.environ.get("AURUM_TRAIL_SCALP_DISTANCE", "2"))
+TRAIL_SWING_START      = float(os.environ.get("AURUM_TRAIL_SWING_START", "30"))
+TRAIL_SWING_DISTANCE   = float(os.environ.get("AURUM_TRAIL_SWING_DISTANCE", "15"))
 # Profit-lock close: if peak >= MIN_PROFIT and profit drops by DRAWDOWN_PCT from peak, close
 PROFIT_LOCK_ENABLED          = _bool_env("AURUM_PROFIT_LOCK_ENABLED", True)
 PROFIT_LOCK_DRAWDOWN_PERCENT = float(os.environ.get("AURUM_PROFIT_LOCK_DRAWDOWN_PERCENT", "20"))
@@ -589,6 +599,10 @@ def execute(sig: Dict[str, Any]) -> None:
     if mhm > 0:
         TICKET_MAX_HOLD[last_result.order] = mhm
         OPEN_TICKET_OPENED_AT[last_result.order] = time.time()
+    # 2026-06-22 audit: store mode tag for dynamic trailing (scalp: $5/$2 · swing: $30/$15)
+    _mode = (sig.get("mode") or "swing").lower()
+    if _mode in ("scalp", "swing"):
+        TICKET_MODE[last_result.order] = _mode
     # v1.6: compute slippage in pips for reporting + dashboard analytics
     pip = _pip_size(sym_info)
     slippage_pips = abs(float(last_result.price) - float(price)) / max(pip, 1e-9)
@@ -937,28 +951,43 @@ def manage_open_positions() -> None:
                     PEAK_PROFITS.pop(ticket, None)
                 continue  # closed, skip trailing
 
-            # 2) Trailing stop: lock peak - TRAILING_DISTANCE once we're past START.
-            if TRAILING_ENABLED and current >= TRAILING_START_PROFIT:
-                # Throttle to avoid hammering MT5
-                if time.time() - LAST_TRAIL_TS.get(ticket, 0.0) < TRAIL_MIN_INTERVAL_SEC:
-                    continue
-                target_lock = max(0.0, peak - TRAILING_DISTANCE)
-                if target_lock <= 0:
-                    continue
-                proposed_sl = _calc_sl_for_target_profit(pos, target_lock)
-                if proposed_sl is None:
-                    continue
-                cur_sl = float(pos.sl) if pos.sl else None
-                sym_info = mt5.symbol_info(pos.symbol)
-                point = float(getattr(sym_info, "point", 0.0001) or 0.0001) if sym_info else 0.0001
-                # NEVER move SL backwards.
-                if pos.type == mt5.POSITION_TYPE_BUY:
-                    if cur_sl is not None and proposed_sl <= cur_sl + point:
+            # 2) Trailing stop: lock peak - DISTANCE once we're past START.
+            #    2026-06-22 audit: thresholds are now per-mode.
+            #    Scalp tickets: start=$5, distance=$2  → grabs the partial-runner profits.
+            #    Swing tickets: start=$30, distance=$15 → lets winners breathe.
+            #    Unknown / legacy tickets fall back to TRAILING_START_PROFIT / DISTANCE env.
+            if TRAILING_ENABLED:
+                _mode_tag = TICKET_MODE.get(ticket)
+                if _mode_tag == "scalp":
+                    trail_start = TRAIL_SCALP_START
+                    trail_dist  = TRAIL_SCALP_DISTANCE
+                elif _mode_tag == "swing":
+                    trail_start = TRAIL_SWING_START
+                    trail_dist  = TRAIL_SWING_DISTANCE
+                else:
+                    trail_start = TRAILING_START_PROFIT
+                    trail_dist  = TRAILING_DISTANCE
+                if current >= trail_start:
+                    # Throttle to avoid hammering MT5
+                    if time.time() - LAST_TRAIL_TS.get(ticket, 0.0) < TRAIL_MIN_INTERVAL_SEC:
                         continue
-                else:  # SELL
-                    if cur_sl is not None and proposed_sl >= cur_sl - point:
+                    target_lock = max(0.0, peak - trail_dist)
+                    if target_lock <= 0:
                         continue
-                _modify_sl(pos, proposed_sl, target_lock)
+                    proposed_sl = _calc_sl_for_target_profit(pos, target_lock)
+                    if proposed_sl is None:
+                        continue
+                    cur_sl = float(pos.sl) if pos.sl else None
+                    sym_info = mt5.symbol_info(pos.symbol)
+                    point = float(getattr(sym_info, "point", 0.0001) or 0.0001) if sym_info else 0.0001
+                    # NEVER move SL backwards.
+                    if pos.type == mt5.POSITION_TYPE_BUY:
+                        if cur_sl is not None and proposed_sl <= cur_sl + point:
+                            continue
+                    else:  # SELL
+                        if cur_sl is not None and proposed_sl >= cur_sl - point:
+                            continue
+                    _modify_sl(pos, proposed_sl, target_lock)
         except Exception as e:
             log.warning("manage_open_positions ticket=%s error: %s", getattr(pos, "ticket", "?"), e)
 
@@ -1009,6 +1038,7 @@ def reconcile_closed() -> None:
         BE_DONE.discard(t)
         TICKET_MAX_HOLD.pop(t, None)
         OPEN_TICKET_OPENED_AT.pop(t, None)
+        TICKET_MODE.pop(t, None)
 
 
 _running = True

@@ -2225,7 +2225,7 @@ async def _scan_and_persist(bots: List[dict]) -> int:
             htf_label = bot.get("higher_tf_confirmation") or "off"
             htf_trend = await _htf_trend(bot["pair"], htf_label) if htf_label not in (None, "off") else None
             if STRATEGY_VERSION == "v2":
-                v2_out = generate_signal_v2(candles, STRATEGY_V2_CFG, htf_trend=htf_trend)
+                v2_out = generate_signal_v2(candles, STRATEGY_V2_CFG, htf_trend=htf_trend, pair=bot["pair"])
                 if v2_out:
                     sig, v2_ctx = v2_out
                 else:
@@ -2278,6 +2278,40 @@ async def _scan_and_persist(bots: List[dict]) -> int:
                 }})
                 await _funnel_record(bot, f"pair_dir_cooldown:{pair}:{sig.side}")
                 continue
+
+            # 2026-06-22 audit (P0) — SL-CLUSTER COOLDOWN.
+            # Week of Jun 15-19: $194.79 of losses came from 16 same-(pair, direction)
+            # loss clusters (e.g. XAU 7× buys all SL, XAG 4× sells all SL). The bot
+            # kept reloading the same losing idea minutes after each stop. New rule:
+            # if there are ≥ 2 SL_HIT trades on the same (pair, side) within the last
+            # 90 minutes, pause that (pair, side) for 120 minutes. Eliminates the
+            # cluster pattern without reducing trade frequency on any working setup
+            # (other directions/symbols continue to fire normally).
+            sl_cluster_since = (now_utc() - timedelta(minutes=90)).isoformat()
+            sl_recent_count = await db.trades.count_documents({
+                "user_id": bot["user_id"],
+                "pair": pair,
+                "side": sig.side,
+                "exit_reason": "sl_hit",
+                "closed_at": {"$gte": sl_cluster_since},
+            })
+            if sl_recent_count >= 2:
+                # Inside the 120-min lockout window (90 min lookback + 30 min margin)?
+                # Compute when the 2nd-most-recent SL hit was; lockout active for 120 min after it.
+                recent_sls = await db.trades.find(
+                    {"user_id": bot["user_id"], "pair": pair, "side": sig.side,
+                     "exit_reason": "sl_hit",
+                     "closed_at": {"$gte": (now_utc() - timedelta(minutes=120)).isoformat()}},
+                    {"_id": 0, "closed_at": 1},
+                ).sort("closed_at", -1).limit(3).to_list(3)
+                if len(recent_sls) >= 2:
+                    await db.bots.update_one({"_id": bot["_id"]}, {"$set": {
+                        "last_scan_at": now_iso(),
+                        "last_scan_result": f"sl_cluster_lockout:{pair}:{sig.side}:{sl_recent_count}sl",
+                        "last_mode": _mode_badge,
+                    }})
+                    await _funnel_record(bot, f"sl_cluster_lockout:{pair}:{sig.side}:{sl_recent_count}sl")
+                    continue
             # FIX #2 — If an OPEN position exists on this pair in the OPPOSITE
             # direction, the new signal must have meaningfully higher confidence
             # (>= 0.10 above the open position's signal) to fire. This is the
@@ -2348,6 +2382,16 @@ async def _scan_and_persist(bots: List[dict]) -> int:
                 atr_ratio=atr_ratio, recent_win_rate=None,
             )
             lot = sizing["lot"]
+            # 2026-06-22 audit (P1): TIME-OF-DAY soft size-down.
+            # Week of Jun 15-19 hourly heatmap: 14h −$33, 16h −$60, 23h −$18.50,
+            # 5h −$19.50, 8h −$18.70. These are known-noisy windows (London-close
+            # transition, NY mid-shift, late-Asia). Don't block trades — just halve
+            # position size during these hours so noise costs less and clean setups
+            # still get taken (frequency preserved).
+            _noisy_hours = {5, 8, 14, 16, 23}
+            if now_utc().hour in _noisy_hours:
+                lot = round(max(0.01, lot * 0.5), 2)
+                sizing["lot_post_noisy_hour_50pct"] = lot
             # Scalp signals expire fast — they're meant to be picked up by the next bridge poll
             # (every 5 s). Swing signals get the standard 30-min TTL.
             ttl_min = 5 if sig.mode == "scalp" else 30

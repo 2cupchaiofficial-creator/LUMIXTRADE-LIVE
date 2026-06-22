@@ -89,7 +89,7 @@ def test_trend_pullback_buy_fires():
     assert sig.side == "buy" and sig.mode == "scalp"
     assert sig.max_hold_minutes == 30
     assert abs((sig.entry - sig.sl) - a[-1] * 1.0) < 1e-9     # SL = 1.0 × ATR (user spec)
-    assert abs((sig.tp - sig.entry) - a[-1] * 1.3) < 1e-9     # TP = 1.3 × ATR
+    assert abs((sig.tp - sig.entry) - a[-1] * 1.8) < 1e-9     # TP = 1.8 × ATR (2026-06-22 audit P0)
     assert sig.confidence >= cfg.scalp_min_confidence
     assert ctx.htf_aligned is True
 

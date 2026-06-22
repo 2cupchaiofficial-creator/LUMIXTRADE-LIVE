@@ -22,6 +22,16 @@ User imported a full-stack auto-trading bot (React + FastAPI + MongoDB + MT5 bri
   - P2-6: Scanner HTF gate blocks only DECISIVELY opposite trend (flat/None = neutral); htf_trend fetched once (dedupe)
   - P2-7: Scalp RR floor 1.3 (swing keeps 2.0), scalp_tp_atr 1.3, max_hold_scalp 30 min
   - Tests: /app/backend/tests/test_audit_fixes.py — 13/13 pass. test_risk_gates.py script ALL PASS. test_htf_confirmation failure verified PRE-EXISTING (fails on unmodified code too). HTTP legacy tests point to stale preview URL (pre-existing env issue).
+- 2026-06-22: WEEKLY AUDIT BATCH (Jun 15-19 ReportHistory analysis):
+  - **P0-A**: Scalp TP widened 1.3 → 1.8 × ATR (StrategyV2Config + conservative_config); min_rr floor lifted scalp 1.3→1.8, swing 2.0→2.5. Reason: avg achieved RR was 1.20 at 37.4% WR → mathematically negative.
+  - **P0-B**: XAG-specific SL multiplier (1.5×). `generate_signal_v2` now accepts `pair=` kwarg; applies effective SL widening only for XAG. Top 4 single-trade losses of the week were all XAG (~$19 each).
+  - **P0-C**: SL-cluster cooldown (`sl_cluster_lockout`): when ≥ 2 sl_hit trades on same (pair, side) within last 90 min → block that (pair, side) for 120 min. server.py gate. Week analysis: $194.79 of losses came from 16 same-direction loss clusters.
+  - **P1-D**: New `_setup_swing_pullback` setup — emits SWING-mode pullback (TP = 3×ATR, hold = 240 min) when HTF aligned + EMA21/55 spread ≥ 0.6×ATR + pullback ≥ 1.0×ATR. Bridges the missing day/swing track (week had only 2 trades with TP > 1% of price).
+  - **P1-E**: Time-of-day soft size-down — lot × 0.5 when hour ∈ {5, 8, 14, 16, 23} UTC. Weekly heatmap showed these as the loss-heavy hours; doesn't block trades, just halves size.
+  - **Dynamic trailing (user-specified)**: per-mode trailing in aurum_bridge.py. Scalp = start $5 / dist $2 · Swing = start $30 / dist $15. New `TICKET_MODE` registry populated at fill from `sig.mode`. Legacy single-value envs still honoured as fallback.
+  - Public bridge copy (frontend/public/aurum_bridge.py) re-synced.
+  - Tests: /app/backend/tests/test_jun22_audit_fixes.py (10 tests, all pass) + updated audit/p0_p1 suites for new RR values (31/32 pass; 1 pre-existing test-ordering artifact unrelated to this batch).
+
 
 ## Audit Findings (key — full report delivered in chat)
 1. Scalp mode dead code under v2: engine.py `_generate_scalp` / `enable_scalping_in_ranges` only used in v1 path; v2's only scalp = liquidity sweep reversal.

@@ -66,7 +66,7 @@ def test_default_sessions_include_asia():
 # ─────────────────────────────────────────────────────────────────────────────
 def test_conservative_config_scalp_values_and_safety_preserved():
     cfg = conservative_config()
-    assert cfg.scalp_tp_atr == 1.3
+    assert cfg.scalp_tp_atr == 1.8
     assert cfg.max_hold_minutes_scalp == 30
     # safety features explicitly preserved per user instruction
     assert cfg.require_displacement is True
@@ -120,7 +120,7 @@ def test_rsi_scalp_buy_fires():
     assert sig.side == "buy" and sig.mode == "scalp"
     assert sig.max_hold_minutes == 30
     assert abs((sig.entry - sig.sl) - 0.001) < 1e-9          # SL = 1.0 × ATR
-    assert abs((sig.tp - sig.entry) - 0.0013) < 1e-9         # TP = 1.3 × ATR
+    assert abs((sig.tp - sig.entry) - 0.0018) < 1e-9         # TP = 1.8 × ATR (2026-06-22 audit P0)
     assert sig.confidence >= cfg.scalp_min_confidence
 
 

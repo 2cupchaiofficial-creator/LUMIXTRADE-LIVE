@@ -185,13 +185,20 @@ def _equal_levels(candles: List[Candle], swings: List[int], price_key: str,
 @dataclass
 class StrategyV2Config:
     sl_atr: float = 1.5
-    tp_atr: float = 3.0          # Higher RR than v1 (2.5 → 3.0) — institutional bias
+    tp_atr: float = 3.0          # Swing target — preserved (RR ≥ 2.5 enforced downstream)
     min_confidence: float = 0.55
     scalp_sl_atr: float = 1.0
-    scalp_tp_atr: float = 1.3   # P2 fix (2026-06): scalp RR band 1.2-1.5 — reachable inside hold window
+    # 2026-06-22 audit (P0): scalp TP widened 1.3 → 1.8. Week of Jun 15-19 showed
+    # avg target RR was 1.31 with 37.4% WR → mathematically negative. Lifting TP
+    # to 1.8×ATR moves break-even WR from 43% → 36% (we are already at 37%).
+    scalp_tp_atr: float = 1.8
     scalp_min_confidence: float = 0.55
-    max_hold_minutes_scalp: int = 30  # P2 fix (2026-06): 45 → 30
-    max_hold_minutes_swing: int = 480  # 8h cap on swings
+    max_hold_minutes_scalp: int = 30
+    max_hold_minutes_swing: int = 480
+    # 2026-06-22 audit (P0): XAG SL multiplier — silver's ATR is ~2× gold relative
+    # to price. Top 4 single-trade losses of the week were XAG ($19, $19, $19, $18).
+    # Bump SL distance for XAG only; keeps frequency, halves blowout size.
+    xag_sl_multiplier: float = 1.5
     # v1.8 — Conservative live-forward filters. Toggled via STRATEGY_CONSERVATIVE env at server startup.
     require_displacement: bool = False        # BOS only valid if a displacement bar confirms
     require_fvg_for_bos: bool = False         # BOS-retest also needs FVG confluence
@@ -217,9 +224,7 @@ def conservative_config() -> "StrategyV2Config":
                                         # Combined with require_htf_alignment + require_displacement, the
                                         # surviving signals at 0.62-0.71 are filtered by structure not just score.
         scalp_sl_atr=1.0,
-        scalp_tp_atr=1.3,               # P2 fix (2026-06): 2.0 → 1.3 — a 2×ATR scalp target was
-                                        # statistically unreachable inside the hold window; scalps
-                                        # were dying by max_hold timeout instead of hitting TP.
+        scalp_tp_atr=1.8,               # 2026-06-22 audit: 1.3 → 1.8 — see StrategyV2Config docstring
         scalp_min_confidence=0.55,      # 0.78 → 0.55 — scalps need looser bar to be useful
         max_hold_minutes_scalp=30,      # P2 fix (2026-06): 60 → 30 — scalps resolve fast or not at all
         max_hold_minutes_swing=360,
@@ -284,6 +289,7 @@ def generate_signal_v2(
     *,
     htf_trend: Optional[str] = None,        # "up" / "down" / "flat" / None
     session_override: Optional[Session] = None,
+    pair: Optional[str] = None,             # 2026-06-22: needed for per-symbol SL widening (XAG)
 ) -> Optional[Tuple[GeneratedSignal, SignalContext]]:
     """Main entry. Returns (signal, context) or None."""
     n = len(candles)
@@ -297,6 +303,21 @@ def generate_signal_v2(
     session = session_override or current_session()
     if session == "off":
         return None
+
+    # 2026-06-22 audit (P0): XAG (silver) needs a wider SL than XAU/FX because its
+    # ATR-as-%-of-price is ~2× higher. Effective SL_atr = cfg.scalp_sl_atr × multiplier
+    # for XAG only. Reward distance is computed from this same SL, so RR ratios are
+    # preserved — we widen the stop, then RR floor widens the TP proportionally.
+    _pair_up = (pair or "").upper()
+    sl_mult = cfg.xag_sl_multiplier if "XAG" in _pair_up else 1.0
+    effective_cfg = cfg
+    if sl_mult != 1.0:
+        # Shallow-copy with bumped SL ATRs
+        from dataclasses import replace
+        effective_cfg = replace(cfg,
+                                sl_atr=cfg.sl_atr * sl_mult,
+                                scalp_sl_atr=cfg.scalp_sl_atr * sl_mult)
+    cfg = effective_cfg
 
     regime = _classify_regime_v2(candles, ef, es, a)
     if regime == "volatile":
@@ -323,9 +344,13 @@ def generate_signal_v2(
     # ROUTER
     if regime in ("trending_up", "trending_down"):
         out = _setup_bos_retest(candles, cfg, ef, es, r, a, regime, session, bos, fvg, disp, htf_trend, ctx)
-        # P0 fix (2026-06): trend-pullback continuation scalp — BOS bars are rare;
-        # live-forward data showed bots idling in `no_setup (trending_up)` for hours.
-        # The bread-and-butter trend entry is the pullback to EMA21 + resumption bar.
+        # 2026-06-22 audit (P1): SWING-pullback track. Week of Jun 15-19 had only 2 trades
+        # all week with target > 1% of price → bot was 100% scalping. This setup emits a
+        # SWING-mode pullback (TP = 3×ATR, hold = 240 min) when HTF agrees AND ATR is healthy,
+        # capturing the trend extensions the scalp track was truncating. Falls through to
+        # the scalp pullback when conditions aren't ripe for a swing.
+        if out is None and htf_trend in ("up", "down") and ctx.atr_ratio >= 1.0:
+            out = _setup_swing_pullback(candles, cfg, ef, es, r, a, regime, session, htf_trend, ctx)
         if out is None:
             out = _setup_trend_pullback(candles, cfg, ef, es, r, a, regime, session, htf_trend, ctx)
     elif squeeze:
@@ -417,10 +442,11 @@ def generate_signal_v2(
 
     # ──────────────────────────────────────────────────────────────────────
     # FIX #1 — Enforce minimum R:R floor on EVERY signal.
-    # P2 fix (2026-06): per-mode floor — swings keep 1:2; scalps use 1:1.3
-    # (a 2R target on a 30-min scalp is unreachable and just times out).
+    # 2026-06-22 audit (P0): floor widened — swing 2.0 → 2.5, scalp 1.3 → 1.8.
+    # Avg achieved RR for the week of Jun 15-19 was 1.20 vs 1.31 target. At a
+    # 37.4% WR the strategy can only profit if RR ≥ 1.7. Floor lifted accordingly.
     # ──────────────────────────────────────────────────────────────────────
-    sig = _enforce_min_rr(sig, min_rr=2.0 if sig.mode == "swing" else 1.3)
+    sig = _enforce_min_rr(sig, min_rr=2.5 if sig.mode == "swing" else 1.8)
 
     log.info("[SIGNAL FIRED] %s · conf=%.2f · regime=%s · sess=%s · entry=%.5f sl=%.5f tp=%.5f · reason=%s",
              sig.side.upper(), sig.confidence, sig.regime, sig.session,
@@ -869,5 +895,93 @@ def _setup_trend_pullback(candles, cfg: StrategyV2Config, ef, es, r, a,
         side=side, entry=entry, sl=sl, tp=tp, confidence=conf,
         regime=regime, session=session, reason=reason,
         mode="scalp", max_hold_minutes=cfg.max_hold_minutes_scalp,
+    )
+    return sig, ctx
+
+
+# ============================================================================
+# Setup #6 — Swing Pullback (TRENDING + HTF aligned + healthy ATR)
+# 2026-06-22 audit (P1) — bridges the missing "day/swing" track.
+# ============================================================================
+def _setup_swing_pullback(candles, cfg: StrategyV2Config, ef, es, r, a,
+                          regime: Regime, session: Session,
+                          htf_trend, ctx: SignalContext):
+    """Day/swing variant of the trend-pullback. Same entry trigger (EMA21 tag +
+    resumption bar) but emits a SWING-mode signal with a wider TP (3×ATR) and
+    a 240-minute hold so the trade can run with the trend rather than getting
+    capped at the scalp partial. Only fires when:
+      • HTF agrees decisively with the regime (not "flat")
+      • EMA21 vs EMA55 spread >= 0.6 × ATR (real trend, not noise)
+      • Healthy volatility (atr_ratio >= 1.0, already checked at router)
+      • Pullback depth >= 1.0 × ATR (deeper pullback than scalp variant)
+    """
+    n = len(candles)
+    if n < 40 or not ef or not es:
+        return None
+    atr_v = a[-1]
+    if atr_v <= 0:
+        return None
+    # Trend strength filter: EMA21 must be cleanly separated from EMA55
+    if abs(ef[-1] - es[-1]) < 0.6 * atr_v:
+        return None
+    last, prev = candles[-1], candles[-2]
+    e21 = ef[-1]
+    rsi_now = r[-1]
+    side: Side = "buy" if regime == "trending_up" else "sell"
+    # HTF must explicitly agree (router already filtered, but be defensive)
+    want = "up" if side == "buy" else "down"
+    if htf_trend != want:
+        return None
+    touch_band = 0.30 * atr_v
+    if side == "buy":
+        if not (38.0 <= rsi_now <= 60.0):
+            return None
+        if last["l"] > e21 + touch_band:
+            return None
+        if last["c"] <= e21:
+            return None
+        if not (last["c"] > last["o"] and last["c"] > prev["c"]):
+            return None
+        local_ext = max(c["h"] for c in candles[-15:-1])
+        pullback_depth = local_ext - last["l"]
+    else:
+        if not (40.0 <= rsi_now <= 62.0):
+            return None
+        if last["h"] < e21 - touch_band:
+            return None
+        if last["c"] >= e21:
+            return None
+        if not (last["c"] < last["o"] and last["c"] < prev["c"]):
+            return None
+        local_ext = min(c["l"] for c in candles[-15:-1])
+        pullback_depth = last["h"] - local_ext
+    if pullback_depth < 1.0 * atr_v:                  # deeper than scalp pullback
+        return None
+
+    ctx.htf_aligned = True
+    entry = last["c"]
+    # Swing uses cfg.sl_atr (1.5×ATR by default) and 3×ATR target. The RR floor
+    # downstream enforces 2.5× minimum so TP won't be tighter than that.
+    sl_dist = atr_v * cfg.sl_atr
+    tp_dist = atr_v * 3.0
+    sl = entry - sl_dist if side == "buy" else entry + sl_dist
+    tp = entry + tp_dist if side == "buy" else entry - tp_dist
+
+    trend_strength = min(0.10, (abs(ef[-1] - es[-1]) / atr_v) * 0.05)
+    base = 0.50
+    structure = 0.10                    # qualified pullback
+    session_s = 0.05 if session in ("london", "new_york", "overlap") else -0.02
+    htf_s = 0.10                        # HTF agreement is required → score reflects it
+    conf = max(0.0, min(0.99, base + structure + trend_strength + session_s + htf_s))
+    if conf < cfg.min_confidence:
+        return None
+    ctx.scores = {"base": base, "structure": structure, "trend": round(trend_strength, 3),
+                  "session": session_s, "htf": htf_s}
+    reason = (f"Swing-pullback {side.upper()} · EMA21 tag · HTF {htf_trend} · "
+              f"RSI {rsi_now:.1f} ({regime})")
+    sig = GeneratedSignal(
+        side=side, entry=entry, sl=sl, tp=tp, confidence=conf,
+        regime=regime, session=session, reason=reason,
+        mode="swing", max_hold_minutes=240,    # 4-hour swing window
     )
     return sig, ctx
