@@ -68,7 +68,7 @@ except ImportError:
 import requests
 
 # ----- config -----
-BRIDGE_VERSION = "1.9.0"
+BRIDGE_VERSION = "1.9.1"
 API_KEY  = os.environ.get("AURUM_API_KEY")
 API_URL  = (os.environ.get("AURUM_API_URL") or "").rstrip("/")
 MT5_LOGIN    = os.environ.get("MT5_LOGIN")
@@ -1078,6 +1078,12 @@ def main():
              "ON" if TRAILING_ENABLED else "OFF", TRAILING_START_PROFIT, TRAILING_DISTANCE,
              "ON" if PROFIT_LOCK_ENABLED else "OFF", PROFIT_LOCK_DRAWDOWN_PERCENT, PROFIT_LOCK_MIN_PROFIT,
              "ON" if PARTIAL_CLOSE_ENABLED else "OFF", PARTIAL_CLOSE_FRACTION * 100.0)
+    # 2026-06-22 audit: surface the per-mode dynamic trailing thresholds so the
+    # startup log unambiguously confirms which build is running on the VPS.
+    log.info("Dynamic trailing (per-mode) · SCALP start=$%.2f dist=$%.2f · SWING start=$%.2f dist=$%.2f · legacy/fallback start=$%.2f dist=$%.2f",
+             TRAIL_SCALP_START, TRAIL_SCALP_DISTANCE,
+             TRAIL_SWING_START, TRAIL_SWING_DISTANCE,
+             TRAILING_START_PROFIT, TRAILING_DISTANCE)
 
     global LAST_LOOP_ERROR
     health_check_every = 30  # seconds

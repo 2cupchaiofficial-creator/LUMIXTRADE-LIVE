@@ -258,7 +258,7 @@ def test_funnel_records_scan_stages():
 # ─────────────────────────────────────────────────────────────────────────────
 def test_bridge_has_spread_vs_sl_filter_and_partials():
     src = open(os.path.join(ROOT, "static", "aurum_bridge.py")).read()
-    assert 'BRIDGE_VERSION = "1.9.0"' in src
+    assert 'BRIDGE_VERSION = "1.9.1"' in src
     assert "AURUM_MAX_SPREAD_SL_PCT" in src
     assert "spread_vs_sl" in src
     # P1-5 partial TP + BE confirmed present (pre-existing v1.8.1 feature)
