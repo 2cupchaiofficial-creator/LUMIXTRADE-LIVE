@@ -31,6 +31,23 @@ User imported a full-stack auto-trading bot (React + FastAPI + MongoDB + MT5 bri
   - **Dynamic trailing (user-specified)**: per-mode trailing in aurum_bridge.py. Scalp = start $5 / dist $2 · Swing = start $30 / dist $15. New `TICKET_MODE` registry populated at fill from `sig.mode`. Legacy single-value envs still honoured as fallback.
   - Public bridge copy (frontend/public/aurum_bridge.py) re-synced.
   - Tests: /app/backend/tests/test_jun22_audit_fixes.py (10 tests, all pass) + updated audit/p0_p1 suites for new RR values (31/32 pass; 1 pre-existing test-ordering artifact unrelated to this batch).
+- 2026-06-23: **PHASE-1 TRADING ENGINE OPTIMIZATION** (deliberate frequency reduction):
+  - **NEW module `engine_config.py`**: DB-backed config layer with 60s cache, per-symbol overrides (XAU 85/60, XAG 85/60, EUR 80/45, GBP 80/45, USDCAD 75/30). Reset-to-defaults supported.
+  - **NEW module `quality_score.py`**: 7-factor trade-quality scorer (H4 trend, H1 trend, ADX, VWAP, S/R, ATR ratio, spread) — max 100, min approval threshold = 80. Near-misses (75-79) logged for telemetry. Includes ADX(14), VWAP(80), D1 EMA21/55 bias (rolled from H1).
+  - **Filter pipeline in server.py scan loop** (in order):
+    1. F3 Session Filter — metals (XAU/XAG) blocked in Asia by default (configurable per session)
+    2. F5 ATR Ratio Filter — reject if ratio < 0.80 (dead) or > 2.00 (explosive)
+    3. F4 Daily Bias Filter — countertrend block when D1 EMA21≠EMA55 decisively; -15 score penalty if neutral
+    4. F2 Instrument Cooldown — 2 consecutive losses → 60min lockout (per-symbol override)
+    5. F1 Trade Quality Score — reject if total < min_score (80 default; 85 for metals)
+  - **Instrument-cooldown trigger** wired into `/api/bridge` close handler — counts trailing losses on (user, pair), upserts a cooldowns doc with expiry when threshold hit
+  - **5 new admin endpoints**: GET/PUT /api/admin/engine-config, POST /api/admin/engine-config/reset-defaults, GET /api/admin/cooldowns + DELETE per cooldown, GET /api/admin/filter-stats, GET /api/admin/symbol-metrics. All `get_current_admin`-protected.
+  - **NEW collections + indexes**: engine_config, cooldowns (unique on user_id+pair), filter_rejections (ts/pair/filter index)
+  - **NEW admin UI** at `/app/admin/engine-config` with 5 tabs (SCORE / COOLDOWN / FILTERS / PER-SYMBOL / TELEMETRY). All thresholds editable; PUT live (no redeploy). AppShell nav updated with "ENGINE" link (admin-only).
+  - **All existing gates preserved**: XAG SL multiplier 1.5×, SL-cluster cooldown, swing-pullback setup, dynamic trailing $5/$2 scalp · $30/$15 swing, time-of-day soft size-down, scalp RR=1.8, swing RR floor=2.5.
+  - User choices applied: 1b (neutral=penalty), 2c (80 all + log near-miss), 3c (skip backtest), 4a (full UI), 5b (FX gets bias+ATR but no session block).
+  - Tests: /app/backend/tests/test_phase1_engine_optimization.py (15 tests). Testing-agent end-to-end suite (/app/backend/tests/test_phase1_admin_e2e.py): 29/29 PASS · 100% backend + 100% frontend.
+
 
 
 ## Audit Findings (key — full report delivered in chat)
