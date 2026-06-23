@@ -1,0 +1,51 @@
+{
+  "summary": "Comprehensive end-to-end testing of Phase-1 Trading Engine Optimization. Verified all 4 admin endpoints (GET/PUT/RESET engine-config, cooldowns, filter-stats, symbol-metrics) via HTTP, admin login → full UI flow on /app/admin/engine-config across all 5 tabs, persistence/cache-invalidation verified via reload, and non-admin redirect protection. 29/29 pytest tests pass (12 new e2e + 17 regression).",
+  "backend_issues": {
+    "critical": [],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_phase1_admin_e2e.py",
+    "/app/backend/tests/test_phase1_engine_optimization.py",
+    "/app/test_reports/pytest/phase1_admin_e2e.xml"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "GET /api/admin/engine-config wraps payload as {config, defaults} — frontend correctly unpacks via apiGet<{config: EngineConfig}>; tests updated to match envelope. Worth documenting this contract in the route docstring.",
+    "Non-admin redirect uses client-side <Navigate to='/app' replace />; backend enforcement via get_current_admin dependency confirmed (401 to unauthenticated and any non-admin caller). Defense-in-depth is correctly implemented.",
+    "server.py is 3377 lines — exceeds 700-line guideline. Consider splitting admin routes (engine-config block ~2693-2820) into a separate module for maintainability. Not blocking."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_phase1_admin_e2e.py (created)"
+  ],
+  "success_rate": {"backend": "100%", "frontend": "100%"},
+  "test_credentials": "admin@bot.com / password (verified working)",
+  "seed_data_creation": "Created one ephemeral TEST_nonadmin_<ts>@test.com signup to verify redirect; can be cleaned later via TEST_ prefix filter.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "All Phase-1 admin endpoints + EngineConfig UI verified end-to-end. Use /app/backend/tests/test_phase1_admin_e2e.py as regression suite. Important contract: GET/PUT /api/admin/engine-config return {config: {...}, defaults: {...}} (not flat config). Tests reset min_score to defaults (80) at end. XAUUSD override min_score=85 is correctly seeded. Non-admin signup auto-creates user with non-admin role; redirect kicks in via client Navigate.",
+  "verified_flows": [
+    "admin login (admin@bot.com/password) → 200 + token",
+    "GET /api/admin/engine-config → {config, defaults} with all 15 Phase-1 keys",
+    "PUT /api/admin/engine-config {min_score: 82} → returns updated config; GET reflects 82 (cache invalidates)",
+    "POST /api/admin/engine-config/reset-defaults → GET returns baked-in min_score=80",
+    "GET /api/admin/cooldowns → {active: [], as_of: ISO}",
+    "GET /api/admin/filter-stats?days=7 → {window_days, by_filter, by_pair, details}",
+    "GET /api/admin/symbol-metrics?days=7 → {window_days, metrics}",
+    "Unauthenticated to all 4 admin endpoints → 401/403 (6 tests)",
+    "UI: /app/admin/engine-config renders engine-config-page with 5 tabs (SCORE, COOLDOWN, FILTERS, PER-SYMBOL, TELEMETRY)",
+    "UI SCORE tab: min-score edit 80→83, save-scoring fires PUT, reload persists value=83; all 7 score-weight-* inputs present",
+    "UI COOLDOWN tab: cd-losses, cd-min, cd-refresh, save-cooldown all visible & cd-refresh click works",
+    "UI FILTERS tab: sess-asia-start/end/metals-block, bias-enabled, bias-neutral-mode, bias-penalty, atr-min, atr-max, save-filters all wired",
+    "UI PER-SYMBOL tab: sym-XAUUSD-min-score shows 85 (override default); save-symbols present",
+    "UI TELEMETRY tab: telemetry-days input + telemetry-refresh button work; loads filter-stats + symbol-metrics",
+    "UI reset-defaults button: min-score returns to 80",
+    "Non-admin signup → navigation to /app/admin/engine-config → redirected to /app (Dashboard); engine-config-page not visible; ENGINE nav link hidden in AppShell"
+  ],
+  "rca_of_the_issue": "N/A — no bugs found. Initial test failures were due to test assertions assuming flat-config response shape; corrected to match actual {config, defaults} envelope contract."
+}

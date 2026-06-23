@@ -17,6 +17,7 @@ import Transactions from "./pages/app/Transactions";
 import Referrals from "./pages/app/Referrals";
 import Settings from "./pages/app/Settings";
 import Admin from "./pages/app/Admin";
+import EngineConfig from "./pages/app/EngineConfig";
 import NotFound from "./pages/NotFound";
 
 const queryClient = new QueryClient();
@@ -41,6 +42,7 @@ const App = () => (
             <Route path="/app/referrals" element={<ProtectedRoute><Referrals /></ProtectedRoute>} />
             <Route path="/app/settings" element={<ProtectedRoute><Settings /></ProtectedRoute>} />
             <Route path="/app/admin" element={<ProtectedRoute><Admin /></ProtectedRoute>} />
+            <Route path="/app/admin/engine-config" element={<ProtectedRoute><EngineConfig /></ProtectedRoute>} />
             <Route path="*" element={<NotFound />} />
           </Routes>
         </BrowserRouter>

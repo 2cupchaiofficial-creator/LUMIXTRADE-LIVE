@@ -1085,6 +1085,44 @@ async def bridge_report(request: Request):
                                   exit_price=exit_price, ticket=tr.get("mt5_ticket"))
         except Exception:
             pass
+
+        # ─── Phase-1 (2026-06-22): INSTRUMENT COOLDOWN trigger on SL_HIT ───
+        # After N consecutive losses on a (user, pair), lock the symbol for cooldown_min.
+        # Reads thresholds from engine_config; respects per-symbol overrides.
+        if exit_reason == "sl_hit":
+            try:
+                from engine_config import load_engine_config, get_symbol_setting
+                _ec_close = await load_engine_config(db)
+                _pair_close = (tr.get("pair") or "").upper()
+                _n_required = int(_ec_close.get("cooldown_consecutive_losses", 2))
+                _cd_minutes = int(get_symbol_setting(_ec_close, _pair_close, "cooldown_min", 60))
+                # Count consecutive losses on this (user, pair) from most recent backwards.
+                _recent = await db.trades.find(
+                    {"user_id": user_id, "pair": _pair_close,
+                     "status": "closed", "pnl": {"$ne": None}},
+                    {"_id": 0, "pnl": 1, "closed_at": 1},
+                ).sort("closed_at", -1).limit(_n_required + 2).to_list(_n_required + 2)
+                _streak = 0
+                for _t in _recent:
+                    if float(_t.get("pnl") or 0) < 0:
+                        _streak += 1
+                    else:
+                        break
+                if _streak >= _n_required:
+                    _expires = (now_utc() + timedelta(minutes=_cd_minutes)).isoformat()
+                    await db.cooldowns.update_one(
+                        {"user_id": user_id, "pair": _pair_close},
+                        {"$set": {
+                            "user_id": user_id, "pair": _pair_close,
+                            "triggered_at": now_iso(), "expires_at": _expires,
+                            "consecutive_losses": _streak, "cooldown_min": _cd_minutes,
+                            "reason": f"{_streak} consecutive losses",
+                        }},
+                        upsert=True,
+                    )
+            except Exception as _cd_e:
+                log.warning("instrument cooldown trigger failed: %s", _cd_e)
+
         return {"status": "ok"}
 
     if event == "reject":
@@ -2170,6 +2208,89 @@ async def _scan_and_persist(bots: List[dict]) -> int:
                 }})
                 await _funnel_record(bot, "insufficient_data")
                 continue
+
+            # ═════════════════════════════════════════════════════════════════
+            # PHASE-1 PRE-SIGNAL FILTERS (2026-06-22 — quality/cooldown engine)
+            # Order matters: cheap rejections first.
+            #   F3 — Session Filter (metals blocked in Asia by default)
+            #   F5 — ATR-Ratio Filter (dead OR explosive markets blocked)
+            #   F4 — Daily-Bias Filter (countertrend block / penalty)
+            #   F2 — Instrument Cooldown (after N consecutive losses)
+            # F1 (Trade-Quality Score) runs AFTER signal generation (needs sig.side).
+            # ═════════════════════════════════════════════════════════════════
+            from engine_config import (
+                load_engine_config, get_symbol_setting, is_metal, current_session_name,
+            )
+            from quality_score import daily_bias as _daily_bias_calc, score_trade
+
+            _ec = await load_engine_config(db)
+            _pair_up = (bot["pair"] or "").upper()
+            _utc_hour = now_utc().hour
+
+            # ── F3: Session Filter (metals only — XAU/XAG blocked in configured sessions) ──
+            _sess_now = current_session_name(_ec, _utc_hour)
+            if is_metal(_pair_up):
+                _blocked = set(_ec.get("metals_blocked_sessions") or [])
+                if _sess_now in _blocked:
+                    _rej = f"metals_session_blocked:{_pair_up}:{_sess_now}"
+                    await db.bots.update_one({"_id": bot["_id"]}, {"$set": {
+                        "last_scan_at": now_iso(), "last_scan_result": _rej}})
+                    await _funnel_record(bot, _rej)
+                    await db.filter_rejections.insert_one({
+                        "ts": now_iso(), "bot_id": bot["_id"], "user_id": bot["user_id"],
+                        "pair": _pair_up, "filter": "session", "reason": _rej,
+                    })
+                    continue
+
+            # ── F5: ATR-Ratio Filter (dead OR explosive markets) ──
+            _atr_arr_pre = atr(candles, 14)
+            if _atr_arr_pre:
+                _atr_now = _atr_arr_pre[-1]
+                _atr_med_list = sorted([x for x in _atr_arr_pre[-50:] if x > 0])
+                _atr_med = _atr_med_list[len(_atr_med_list) // 2] if _atr_med_list else _atr_now
+                _ratio = (_atr_now / _atr_med) if _atr_med > 0 else 1.0
+                _lo = float(_ec.get("atr_ratio_min", 0.80))
+                _hi = float(_ec.get("atr_ratio_max", 2.00))
+                if not (_lo <= _ratio <= _hi):
+                    _state = "dead" if _ratio < _lo else "explosive"
+                    _rej = f"atr_ratio_{_state}:{_ratio:.2f}_band[{_lo},{_hi}]"
+                    await db.bots.update_one({"_id": bot["_id"]}, {"$set": {
+                        "last_scan_at": now_iso(), "last_scan_result": _rej}})
+                    await _funnel_record(bot, _rej)
+                    await db.filter_rejections.insert_one({
+                        "ts": now_iso(), "bot_id": bot["_id"], "user_id": bot["user_id"],
+                        "pair": _pair_up, "filter": "atr_ratio", "reason": _rej,
+                        "atr_ratio": round(_ratio, 3),
+                    })
+                    continue
+
+            # ── F4: Daily-Bias compute (used after signal for side check + score penalty) ──
+            _bias_value = "neutral"
+            if _ec.get("daily_bias_enabled", True):
+                try:
+                    _h1_for_d1 = await fetch_candles(bot["pair"], "H1", 2000)
+                    _bias_value = _daily_bias_calc(_h1_for_d1)
+                except Exception as _e:
+                    log.debug("daily_bias compute failed: %s", _e)
+                    _bias_value = "neutral"
+
+            # ── F2: Instrument Cooldown — check BEFORE strategy (cheaper rejection) ──
+            _cd_doc = await db.cooldowns.find_one({"pair": _pair_up, "user_id": bot["user_id"]})
+            if _cd_doc and _cd_doc.get("expires_at"):
+                if _cd_doc["expires_at"] > now_iso():
+                    _rej = f"instrument_cooldown:{_pair_up}:until_{_cd_doc['expires_at']}"
+                    await db.bots.update_one({"_id": bot["_id"]}, {"$set": {
+                        "last_scan_at": now_iso(), "last_scan_result": _rej}})
+                    await _funnel_record(bot, _rej)
+                    await db.filter_rejections.insert_one({
+                        "ts": now_iso(), "bot_id": bot["_id"], "user_id": bot["user_id"],
+                        "pair": _pair_up, "filter": "instrument_cooldown", "reason": _rej,
+                    })
+                    continue
+                else:
+                    # Cooldown expired — auto-clear so it doesn't haunt future scans.
+                    await db.cooldowns.delete_one({"_id": _cd_doc["_id"]})
+
             if bot["pair"] not in cached_symbols:
                 cached_symbols.add(bot["pair"])
                 rows = []
@@ -2266,6 +2387,72 @@ async def _scan_and_persist(bots: List[dict]) -> int:
                     "last_mode": _mode_badge,
                 }})
                 await _funnel_record(bot, f"session_filtered:{sig.session}")
+                continue
+
+            # ═════════════════════════════════════════════════════════════════
+            # PHASE-1 POST-SIGNAL FILTERS (2026-06-22)
+            #   F4b — Daily-Bias countertrend check (block or penalty per config)
+            #   F1  — Trade-Quality Score (0-100; reject below min_score per symbol)
+            # ═════════════════════════════════════════════════════════════════
+            # F4b — Countertrend block: only fires when daily_bias is decisive
+            # (bullish/bearish). Neutral bias is handled inside the score (penalty).
+            if _ec.get("daily_bias_enabled", True):
+                _want = "bullish" if sig.side == "buy" else "bearish"
+                if _bias_value in ("bullish", "bearish") and _bias_value != _want:
+                    _rej = f"daily_bias_countertrend:{_pair_up}:sig_{sig.side}_vs_d1_{_bias_value}"
+                    await db.bots.update_one({"_id": bot["_id"]}, {"$set": {
+                        "last_scan_at": now_iso(), "last_scan_result": _rej,
+                        "last_mode": _mode_badge, "last_daily_bias": _bias_value}})
+                    await _funnel_record(bot, _rej)
+                    await db.filter_rejections.insert_one({
+                        "ts": now_iso(), "bot_id": bot["_id"], "user_id": bot["user_id"],
+                        "pair": _pair_up, "filter": "daily_bias", "reason": _rej,
+                        "daily_bias": _bias_value, "side": sig.side,
+                    })
+                    continue
+
+            # F1 — Trade-Quality Score (7 factors, 0-100). Needs H1 + H4 candle history.
+            try:
+                _candles_h1_score = await fetch_candles(bot["pair"], "H1", 200)
+            except Exception:
+                _candles_h1_score = []
+            try:
+                _candles_h4_score = await fetch_candles(bot["pair"], "H4", 200)
+            except Exception:
+                _candles_h4_score = []
+            _sr_action = (v2_ctx.sr_action if v2_ctx else None) or "ok"
+            _score = score_trade(
+                side=sig.side, symbol=_pair_up,
+                candles=candles, candles_h1=_candles_h1_score, candles_h4=_candles_h4_score,
+                cfg=_ec, signal_sl=sig.sl, signal_entry=sig.entry,
+                spread_at_fill=None,                      # broker spread checked at bridge fill time
+                sr_action=_sr_action, daily_bias_value=_bias_value,
+            )
+            _min_score = int(get_symbol_setting(_ec, _pair_up, "min_score", 80))
+            _score.threshold = _min_score
+            _score.approved = _score.total >= _min_score
+            log.info("[QUALITY-SCORE] %s %s · total=%d/%d · h4=%d h1=%d adx=%d vwap=%d sr=%d atr=%d spr=%d · bias=%s(-%d) · %s",
+                     _pair_up, sig.side, _score.total, _min_score,
+                     _score.h4_trend, _score.h1_trend, _score.adx, _score.vwap,
+                     _score.sr, _score.atr_ratio, _score.spread,
+                     _bias_value, _score.daily_bias_penalty,
+                     "APPROVED" if _score.approved else "REJECTED")
+            # Near-miss logging (75-79): keep for telemetry, don't fire.
+            _near_lo = int(_ec.get("near_miss_lower", 75))
+            if not _score.approved:
+                _is_near_miss = _near_lo <= _score.total < _min_score
+                _rej = f"quality_score:{_score.total}<{_min_score}" + (":near_miss" if _is_near_miss else "")
+                await db.bots.update_one({"_id": bot["_id"]}, {"$set": {
+                    "last_scan_at": now_iso(), "last_scan_result": _rej,
+                    "last_mode": _mode_badge, "last_quality_score": _score.total,
+                    "last_daily_bias": _bias_value}})
+                await _funnel_record(bot, _rej)
+                await db.filter_rejections.insert_one({
+                    "ts": now_iso(), "bot_id": bot["_id"], "user_id": bot["user_id"],
+                    "pair": _pair_up, "filter": "quality_score", "reason": _rej,
+                    "score": _score.to_dict(), "side": sig.side, "near_miss": _is_near_miss,
+                    "daily_bias": _bias_value,
+                })
                 continue
             # FIX #2 — Block same-(pair, direction) duplicates fired by sibling bots
             # within 1 closed bar window. If user has a SELL fired ≤ TF minutes ago,
@@ -2418,6 +2605,9 @@ async def _scan_and_persist(bots: List[dict]) -> int:
                     "bos": v2_ctx.bos, "sweep": v2_ctx.sweep,
                     "displacement": v2_ctx.displacement,
                 } if v2_ctx else None),
+                # Phase-1 (2026-06-22): quality-score + daily-bias telemetry for the journal
+                "quality_score": _score.to_dict(),
+                "daily_bias": _bias_value,
             })
             # Fire-and-forget Telegram alert (admin-level channel for v1)
             try:
@@ -2496,6 +2686,140 @@ async def bridge_candles(body: BridgeCandleBatch, request: Request):
         return {"written": 0}
     written = await store_candles(body.pair, body.timeframe, body.rows)
     return {"written": written, "pair": body.pair.upper(), "timeframe": body.timeframe}
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# PHASE-1 ADMIN — Engine Configuration, Cooldowns, Filter Stats, Symbol Metrics
+# (2026-06-22) — Backs the /app/admin/engine-config UI page.
+# ════════════════════════════════════════════════════════════════════════════
+from engine_config import (
+    load_engine_config as _load_engine_cfg,
+    save_engine_config as _save_engine_cfg,
+    DEFAULT_CONFIG as _DEFAULT_ENGINE_CFG,
+)
+
+
+@api.get("/admin/engine-config")
+async def admin_get_engine_config(admin: dict = Depends(get_current_admin)):
+    cfg = await _load_engine_cfg(db)
+    return {"config": cfg, "defaults": _DEFAULT_ENGINE_CFG}
+
+
+@api.put("/admin/engine-config")
+async def admin_put_engine_config(body: Dict[str, Any], admin: dict = Depends(get_current_admin)):
+    cfg = await _save_engine_cfg(db, body or {}, admin_id=admin["_id"])
+    return {"config": cfg, "updated_at": cfg.get("updated_at")}
+
+
+@api.post("/admin/engine-config/reset-defaults")
+async def admin_reset_engine_config(admin: dict = Depends(get_current_admin)):
+    """Wipe the DB doc; next load returns the built-in defaults."""
+    await db.engine_config.delete_one({"_id": "global"})
+    from engine_config import invalidate_cache
+    invalidate_cache()
+    return {"reset": True, "config": _DEFAULT_ENGINE_CFG}
+
+
+@api.get("/admin/cooldowns")
+async def admin_get_cooldowns(admin: dict = Depends(get_current_admin)):
+    """Return all active cooldowns (expires_at > now)."""
+    now = now_iso()
+    rows = await db.cooldowns.find(
+        {"expires_at": {"$gt": now}}, {"_id": 0}
+    ).sort("expires_at", -1).to_list(500)
+    return {"active": rows, "as_of": now}
+
+
+@api.delete("/admin/cooldowns/{pair}/{user_id}")
+async def admin_clear_cooldown(pair: str, user_id: str, admin: dict = Depends(get_current_admin)):
+    res = await db.cooldowns.delete_one({"pair": pair.upper(), "user_id": user_id})
+    return {"deleted": res.deleted_count}
+
+
+@api.get("/admin/filter-stats")
+async def admin_filter_stats(days: int = 7, admin: dict = Depends(get_current_admin)):
+    """Aggregate rejected trades by filter for the last `days` days."""
+    cutoff = (now_utc() - timedelta(days=max(1, min(days, 90)))).isoformat()
+    pipeline = [
+        {"$match": {"ts": {"$gte": cutoff}}},
+        {"$group": {"_id": {"filter": "$filter", "pair": "$pair"},
+                    "count": {"$sum": 1}}},
+        {"$sort": {"count": -1}},
+        {"$limit": 200},
+    ]
+    rows = await db.filter_rejections.aggregate(pipeline).to_list(500)
+    by_filter: Dict[str, int] = {}
+    by_pair: Dict[str, int] = {}
+    for r in rows:
+        f = r["_id"].get("filter") or "unknown"
+        p = r["_id"].get("pair") or "?"
+        by_filter[f] = by_filter.get(f, 0) + int(r["count"])
+        by_pair[p] = by_pair.get(p, 0) + int(r["count"])
+    return {"window_days": days, "by_filter": by_filter, "by_pair": by_pair,
+            "details": rows}
+
+
+@api.get("/admin/symbol-metrics")
+async def admin_symbol_metrics(days: int = 7, admin: dict = Depends(get_current_admin)):
+    """Per-symbol performance for the last `days` days. Used by the Phase-2
+    AI probability engine for adaptive tuning."""
+    cutoff = (now_utc() - timedelta(days=max(1, min(days, 365)))).isoformat()
+    trades = await db.trades.find(
+        {"status": "closed", "closed_at": {"$gte": cutoff}, "pnl": {"$ne": None}},
+        {"_id": 0, "pair": 1, "side": 1, "pnl": 1, "closed_at": 1,
+         "opened_at": 1, "exit_reason": 1, "session": 1, "initial_sl": 1,
+         "initial_tp": 1, "entry": 1},
+    ).to_list(20000)
+    metrics: Dict[str, Dict[str, Any]] = {}
+    for t in trades:
+        pair = (t.get("pair") or "?").upper()
+        m = metrics.setdefault(pair, {
+            "trades": 0, "wins": 0, "losses": 0, "be": 0,
+            "gross_profit": 0.0, "gross_loss": 0.0,
+            "rr_sum": 0.0, "rr_count": 0,
+            "by_session": {},
+        })
+        m["trades"] += 1
+        pnl = float(t.get("pnl") or 0)
+        if pnl > 0:
+            m["wins"] += 1
+            m["gross_profit"] += pnl
+        elif pnl < 0:
+            m["losses"] += 1
+            m["gross_loss"] += pnl
+        else:
+            m["be"] += 1
+        sl_d = abs(float(t.get("initial_sl") or 0) - float(t.get("entry") or 0))
+        tp_d = abs(float(t.get("initial_tp") or 0) - float(t.get("entry") or 0))
+        if sl_d > 0:
+            m["rr_sum"] += tp_d / sl_d
+            m["rr_count"] += 1
+        sess = t.get("session") or "?"
+        s = m["by_session"].setdefault(sess, {"trades": 0, "wins": 0, "pnl": 0.0})
+        s["trades"] += 1
+        s["pnl"] += pnl
+        if pnl > 0:
+            s["wins"] += 1
+    # Compute derived fields
+    for pair, m in metrics.items():
+        plays = m["wins"] + m["losses"]
+        m["win_rate_pct"] = round((m["wins"] / plays) * 100, 1) if plays else 0.0
+        m["profit_factor"] = round(m["gross_profit"] / abs(m["gross_loss"]), 2) if m["gross_loss"] else None
+        m["net_pnl"] = round(m["gross_profit"] + m["gross_loss"], 2)
+        m["avg_rr"] = round(m["rr_sum"] / m["rr_count"], 2) if m["rr_count"] else None
+    # Add rejected/filtered counts in same window
+    rej = await db.filter_rejections.aggregate([
+        {"$match": {"ts": {"$gte": cutoff}}},
+        {"$group": {"_id": "$pair", "count": {"$sum": 1}}},
+    ]).to_list(500)
+    for r in rej:
+        pair = (r["_id"] or "?").upper()
+        if pair not in metrics:
+            metrics[pair] = {"trades": 0, "wins": 0, "losses": 0, "be": 0,
+                             "win_rate_pct": 0.0, "profit_factor": None,
+                             "net_pnl": 0.0, "avg_rr": None, "by_session": {}}
+        metrics[pair]["filtered_count"] = int(r["count"])
+    return {"window_days": days, "metrics": metrics}
 
 
 @api.get("/bridge/stream-config")
@@ -2928,6 +3252,12 @@ async def on_startup():
     # Bridge-fed candle store
     await db.candles.create_index([("pair", 1), ("timeframe", 1), ("t", -1)])
     await db.candles.create_index([("pair", 1), ("timeframe", 1), ("t", 1)], unique=True)
+    # Phase-1 (2026-06-22) — engine config + cooldowns + filter telemetry
+    await db.cooldowns.create_index([("user_id", 1), ("pair", 1)], unique=True)
+    await db.cooldowns.create_index([("expires_at", 1)])
+    await db.filter_rejections.create_index([("ts", -1)])
+    await db.filter_rejections.create_index([("pair", 1), ("filter", 1), ("ts", -1)])
+    await db.engine_config.create_index([("_id", 1)])
 
     # Backfill min_confidence on bots that still have 0.6 stored (engine-tuning v2 default = 0.5)
     backfill_res = await db.bots.update_many(

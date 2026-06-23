@@ -1,7 +1,7 @@
 import { Link, NavLink, useNavigate } from "react-router-dom";
 import { useAuth } from "@/contexts/AuthContext";
 import { useIsAdmin } from "@/hooks/useIsAdmin";
-import { Activity, BarChart3, Bot, CreditCard, Download, Gift, LogOut, Radio, Receipt, Settings, ShieldCheck } from "lucide-react";
+import { Activity, BarChart3, Bot, CreditCard, Download, Gift, LogOut, Radio, Receipt, Settings, ShieldCheck, Sliders } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { LumixLogo } from "@/components/LumixLogo";
 
@@ -21,7 +21,10 @@ export const AppShell = ({ children }: { children: React.ReactNode }) => {
   const { user, signOut } = useAuth();
   const isAdmin = useIsAdmin();
   const navigate = useNavigate();
-  const items = isAdmin ? [...nav, { to: "/app/admin", label: "ADMIN", icon: ShieldCheck }] : nav;
+  const items = isAdmin ? [...nav,
+    { to: "/app/admin", label: "ADMIN", icon: ShieldCheck },
+    { to: "/app/admin/engine-config", label: "ENGINE", icon: Sliders },
+  ] : nav;
   const initials = (user?.display_name || user?.email || "?").slice(0, 1).toUpperCase();
   return (
     <div className="min-h-screen flex flex-col bg-background">
